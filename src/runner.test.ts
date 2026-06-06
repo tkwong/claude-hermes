@@ -723,7 +723,7 @@ describe("compactCurrentSession — status sink", () => {
 });
 
 // --- status label must not leak the user's prompt ---
-// Regression: the Discord status sink posts a "Hermes working… — <label>"
+// Regression: the Discord status sink posts a "agent working… — <label>"
 // header. Earlier revisions passed prompt.slice(0, 140) as the label, which
 // echoed the user's own message back into the public status channel. The
 // label must be an internal task identifier, never the prompt body.

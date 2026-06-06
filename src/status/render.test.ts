@@ -5,7 +5,7 @@ describe("createRenderer — running state", () => {
   test("initial render shows working header + elapsed seconds with no tools yet", () => {
     const r = createRenderer("Tweak README", 1000);
     const text = r.render(5000);
-    expect(text).toContain("Hermes working");
+    expect(text).toContain("agent working");
     expect(text).toContain("4s");
   });
 
@@ -209,7 +209,7 @@ describe("createRenderer — streaming reply text", () => {
 
     const lines = text.split("\n");
     // Header on line 0, writing on line 1, then tool line(s) after.
-    expect(lines[0]).toContain("Hermes working");
+    expect(lines[0]).toContain("agent working");
     expect(lines[1]).toContain("✍️ Writing reply… (2 chars)");
   });
 
@@ -248,7 +248,7 @@ describe("createRenderer — streaming reply text", () => {
     r.apply({ kind: "tool_use_end", toolUseId: "tu-1", ok: true });
     r.apply({ kind: "text_delta", text: " world" });
     const text = r.render(1000);
-    expect(text).toContain("Hermes working");
+    expect(text).toContain("agent working");
     expect(text).toContain("✍️ Writing reply… (11 chars)");
     const readLine = text.split("\n").find((l) => l.includes("Read(a.ts)")) ?? "";
     expect(readLine).toContain("✓");

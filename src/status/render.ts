@@ -8,7 +8,7 @@
  *
  * Output shape (while running):
  *
- *   ⏳ Hermes working… (12s)
+ *   ⏳ agent working… (12s)
  *   📖 Read(foo.ts) ✓
  *   ✏️ Edit(bar.ts) ✓
  *   🖥️ Bash(bun test) ← active
@@ -70,7 +70,7 @@ export function createRenderer(taskLabel: string, startedAt?: number): Renderer 
 
   function render(now?: number): string {
     const secs = elapsedSeconds(now);
-    const lines: string[] = [`⏳ Hermes working… (${secs}s) — ${taskLabel}`];
+    const lines: string[] = [`⏳ agent working… (${secs}s) — ${taskLabel}`];
     if (replyChars > 0) {
       lines.push(`✍️ Writing reply… (${replyChars} chars)`);
     }
