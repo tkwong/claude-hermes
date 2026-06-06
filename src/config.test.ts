@@ -143,6 +143,29 @@ describe("loadSettings / reloadSettings", () => {
     }
   });
 
+  test("parses discord.channelDirectories, dropping non-string values, defaulting to {}", async () => {
+    await writeSettings(`{
+  "discord": {
+    "token": "",
+    "channelDirectories": {
+      "111": "/tmp/projectA",
+      "222": "/tmp/projectB",
+      "333": 12345
+    }
+  }
+}
+`);
+    const settings = await config.reloadSettings();
+    expect(settings.discord.channelDirectories).toEqual({
+      "111": "/tmp/projectA",
+      "222": "/tmp/projectB",
+    });
+
+    await writeSettings(`{ "discord": { "token": "" } }`);
+    const defaults = await config.reloadSettings();
+    expect(defaults.discord.channelDirectories).toEqual({});
+  });
+
   test("plugins.preflightOnStart defaults to false (off unless explicitly enabled)", async () => {
     await config.initConfig();
     const settings = await config.reloadSettings();

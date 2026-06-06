@@ -221,13 +221,15 @@ async function runClaudeOnce(
   model: string,
   api: string,
   baseEnv: Record<string, string>,
-  timeoutMs: number = CLAUDE_TIMEOUT_MS
+  timeoutMs: number = CLAUDE_TIMEOUT_MS,
+  cwd: string = process.cwd(),
 ): Promise<{ rawStdout: string; stderr: string; exitCode: number }> {
   const args = [...baseArgs];
   const normalizedModel = model.trim().toLowerCase();
   if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
 
   const proc = Bun.spawn(args, {
+    cwd,
     stdout: "pipe",
     stderr: "pipe",
     env: buildChildEnv(baseEnv, model, api),
@@ -297,6 +299,7 @@ async function runClaudeOnceStreaming(
   sink: StatusSink,
   taskId: string,
   taskLabel: string,
+  cwd: string = process.cwd(),
 ): Promise<{
   rawStdout: string;
   stderr: string;
@@ -312,6 +315,7 @@ async function runClaudeOnceStreaming(
   await sink.open(taskId, taskLabel);
 
   const proc = Bun.spawn(args, {
+    cwd,
     stdout: "pipe",
     stderr: "pipe",
     env: buildChildEnv(baseEnv, model, api),
@@ -438,9 +442,9 @@ export function extractSessionAndResult(
   return extractSessionAndResultFromParsed(parsed);
 }
 
-function dirScopePrompt(): string {
+function dirScopePrompt(cwd: string = process.cwd()): string {
   return [
-    `CRITICAL SECURITY CONSTRAINT: You are scoped to the project directory: ${process.cwd()}`,
+    `CRITICAL SECURITY CONSTRAINT: You are scoped to the project directory: ${cwd}`,
     "You MUST NOT read, write, edit, or delete any file outside this directory.",
     "You MUST NOT run bash commands that modify anything outside this directory (no cd /, no /etc, no ~/, no ../.. escapes).",
     "If a request requires accessing files outside the project, refuse and explain why.",
@@ -717,6 +721,7 @@ async function execClaude(
   threadId?: string,
   sink?: StatusSink,
   source: ThreadSource = "cli",
+  cwd: string = process.cwd(),
 ): Promise<RunResult> {
   const logs = logsDir();
   await mkdir(logs, { recursive: true });
@@ -802,20 +807,20 @@ async function execClaude(
     let blocks: Awaited<ReturnType<typeof readAllBlocks>> = [];
     let runtimeDigest = "";
     try {
-      blocks = await readAllBlocks(process.cwd());
+      blocks = await readAllBlocks(cwd);
     } catch {
       // Block read failures are non-fatal: compose without them rather than
       // dropping the whole runtime memory layer.
     }
     try {
-      const db = await getSharedDb(process.cwd());
+      const db = await getSharedDb(cwd);
       runtimeDigest = buildRuntimeMemoryDigest(db);
     } catch {
       // DB digest failures are also non-fatal; file-backed memory still loads.
     }
     const runtimeMemory = await composeSystemPrompt({
       memoryScope: "workspace",
-      cwd: process.cwd(),
+      cwd,
       blocks,
       runtimeDigest,
       includeAgentMemoryHint: true,
@@ -825,7 +830,7 @@ async function execClaude(
     console.error(`[${new Date().toLocaleTimeString()}] Failed to compose runtime memory layer:`, e);
   }
 
-  if (security.level !== "unrestricted") appendParts.push(dirScopePrompt());
+  if (security.level !== "unrestricted") appendParts.push(dirScopePrompt(cwd));
   if (appendParts.length > 0) {
     args.push("--append-system-prompt", appendParts.join("\n\n"));
   }
@@ -851,8 +856,9 @@ async function execClaude(
         sink,
         name,
         name,
+        cwd,
       )
-    : await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs);
+    : await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, cwd);
   const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
   let usedFallback = false;
 
@@ -870,8 +876,9 @@ async function execClaude(
           sink,
           name,
           name,
+          cwd,
         )
-      : await runClaudeOnce(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs);
+      : await runClaudeOnce(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, cwd);
     usedFallback = true;
   }
 
@@ -951,15 +958,15 @@ async function execClaude(
   // shadow rows under `<source>:<thread>` / bare `sessionId`, which never
   // joined to the live session-manager rows.
   if (exitCode === 0 && !rateLimitMessage && sessionId && sessionId !== "unknown") {
-    const persistKey = threadId ? threadKey(source, threadId) : workspaceKey(process.cwd());
+    const persistKey = threadId ? threadKey(source, threadId) : workspaceKey(cwd);
     const persistScope = threadId ? "per-thread" : "workspace";
     const persistSource = threadId ? source : "cli";
     await persistTurn({
-      cwd: process.cwd(),
+      cwd,
       key: persistKey,
       source: persistSource,
       scope: persistScope,
-      workspace: process.cwd(),
+      workspace: cwd,
       thread: threadId,
       claudeSessionId: sessionId,
       userPrompt: prompt,
@@ -970,7 +977,7 @@ async function execClaude(
       void (async () => {
         try {
           await captureCandidateSkill(
-            { prompt, reply: stdout, tools: exec.toolCalls ?? [], cwd: process.cwd() },
+            { prompt, reply: stdout, tools: exec.toolCalls ?? [], cwd },
             { captureCandidateSkills: true },
           );
         } catch {
@@ -1071,8 +1078,9 @@ export async function run(
   threadId?: string,
   sink?: StatusSink,
   source: ThreadSource = "cli",
+  cwd: string = process.cwd(),
 ): Promise<RunResult> {
-  return enqueue(() => execClaude(name, prompt, threadId, sink, source), threadId, source);
+  return enqueue(() => execClaude(name, prompt, threadId, sink, source, cwd), threadId, source);
 }
 
 function prefixUserMessageWithClock(prompt: string): string {
@@ -1092,8 +1100,9 @@ export async function runUserMessage(
   threadId?: string,
   sink?: StatusSink,
   source: ThreadSource = "cli",
+  cwd: string = process.cwd(),
 ): Promise<RunResult> {
-  return run(name, prefixUserMessageWithClock(prompt), threadId, sink, source);
+  return run(name, prefixUserMessageWithClock(prompt), threadId, sink, source, cwd);
 }
 
 /**

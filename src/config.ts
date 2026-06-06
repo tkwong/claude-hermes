@@ -54,7 +54,7 @@ const DEFAULT_SETTINGS: Settings = {
     forwardToDiscord: false,
   },
   telegram: { token: "", allowedUserIds: [] },
-  discord: { token: "", allowedUserIds: [], listenChannels: [], statusChannelId: "" },
+  discord: { token: "", allowedUserIds: [], listenChannels: [], statusChannelId: "", channelDirectories: {} },
   security: { level: "moderate", allowedTools: [], disallowedTools: [], bypassPermissions: false },
   stt: { baseUrl: "", model: "" },
   plugins: { preflightOnStart: false },
@@ -88,6 +88,7 @@ export interface DiscordConfig {
   allowedUserIds: string[]; // Discord snowflake IDs exceed Number.MAX_SAFE_INTEGER
   listenChannels: string[]; // Channel IDs where bot responds to all messages (no mention needed)
   statusChannelId?: string; // Channel ID where live job/heartbeat status messages are posted
+  channelDirectories?: Record<string, string>; // Channel ID → project working directory (cwd) for that channel's Claude runs
 }
 
 export type SecurityLevel =
@@ -333,6 +334,14 @@ function parseSettings(raw: Record<string, any>, discordUserIdsRaw: string[] = [
       statusChannelId: typeof raw.discord?.statusChannelId === "string"
         ? raw.discord.statusChannelId.trim()
         : "",
+      channelDirectories:
+        raw.discord?.channelDirectories && typeof raw.discord.channelDirectories === "object"
+          ? Object.fromEntries(
+              Object.entries(raw.discord.channelDirectories as Record<string, unknown>)
+                .filter(([, v]) => typeof v === "string")
+                .map(([k, v]) => [String(k), String(v)]),
+            )
+          : {},
     },
     security: {
       level,

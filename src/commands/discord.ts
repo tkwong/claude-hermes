@@ -126,6 +126,24 @@ let readyGuildIds: Set<string> | null = null;
 // Track known thread channel IDs and their parent channel IDs for multi-session support
 const knownThreads = new Map<string, { parentId: string }>();
 
+/**
+ * Resolve the project working directory (cwd) for a Discord channel.
+ * Maps the channel — or, for a thread, its parent channel — via
+ * `discord.channelDirectories`. Falls back to the daemon's own cwd when the
+ * channel is unmapped or the mapped directory does not exist, so unconfigured
+ * channels keep their current behaviour.
+ */
+function resolveChannelCwd(channelId: string): string {
+  const map = getSettings().discord.channelDirectories ?? {};
+  const lookupId = knownThreads.get(channelId)?.parentId ?? channelId;
+  const dir = map[lookupId];
+  if (dir && existsSync(dir)) return dir;
+  if (dir) {
+    console.warn(`[Discord] channelDirectories maps ${lookupId} → ${dir} but it does not exist; falling back to daemon cwd`);
+  }
+  return process.cwd();
+}
+
 // --- Debug ---
 
 function debugLog(message: string): void {
@@ -578,7 +596,7 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
       transport: discordStatusTransport(config.token),
       channelId,
     });
-    const result = await runUserMessage("discord", prefixedPrompt, threadId, statusSink, "discord");
+    const result = await runUserMessage("discord", prefixedPrompt, threadId, statusSink, "discord", resolveChannelCwd(channelId));
 
     if (result.exitCode !== 0) {
       await sendMessage(config.token, channelId, `Error (exit ${result.exitCode}): ${result.stderr || result.stdout || "Unknown error"}`);
@@ -790,6 +808,7 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
           threadId,
           statusSink,
           "discord",
+          channelId ? resolveChannelCwd(channelId) : process.cwd(),
         );
 
         const body =
@@ -858,7 +877,7 @@ async function handleGuildCreate(token: string, guild: DiscordGuild): Promise<vo
     "Write a short first message for the server. Confirm I was added and explain how to trigger me (mention or reply).";
 
   try {
-    const result = await run("discord", eventPrompt);
+    const result = await run("discord", eventPrompt, undefined, undefined, "cli", resolveChannelCwd(channelId));
     if (result.exitCode !== 0) {
       await sendMessage(config.token, channelId, "I was added to this server. Mention me to start.");
       return;
