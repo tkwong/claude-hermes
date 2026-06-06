@@ -1,0 +1,5 @@
+{
+  "mcpServers": {
+    "hermes-shim": { "command": "bun", "args": ["./src/shim/channel-shim.ts"] }
+  }
+}

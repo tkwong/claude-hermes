@@ -26,6 +26,7 @@
     "typescript": "^5.6.3"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "ogg-opus-decoder": "^1.7.3"
   }
 }
