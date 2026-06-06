@@ -464,7 +464,11 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     }
 
     // --- Thread management: pattern-based intent classification ---
-    if (isGuild && cleanContent.length < 200) {
+    // DISABLED by user (tszkan): keyword classifier (spawn/hire/deploy/開/派...)
+    // false-fires on normal sentences and splits them into garbage thread names.
+    // Flip ENABLE_THREAD_INTENT back to true to restore the feature.
+    const ENABLE_THREAD_INTENT = false;
+    if (ENABLE_THREAD_INTENT && isGuild && cleanContent.length < 200) {
       const intent = classifyThreadIntent(cleanContent);
       if (intent && intent.action === "hire" && intent.names.length > 0) {
         const results: string[] = [];
