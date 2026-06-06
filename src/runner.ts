@@ -728,7 +728,7 @@ async function execClaude(
 
   const existing = threadId
     ? await getThreadSession(source, threadId)
-    : await getSession();
+    : await getSession(cwd);
   const isNew = !existing;
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const logFile = join(logs, `${name}-${timestamp}.log`);
@@ -907,7 +907,7 @@ async function execClaude(
           await createThreadSession(source, threadId, sessionId);
           console.log(`[${new Date().toLocaleTimeString()}] Thread session created: ${sessionId} (thread ${threadId.slice(0, 8)})`);
         } else {
-          await createSession(sessionId);
+          await createSession(sessionId, cwd);
           console.log(`[${new Date().toLocaleTimeString()}] Session created: ${sessionId}`);
         }
       } else if (streamedResult !== undefined) {
@@ -926,7 +926,7 @@ async function execClaude(
           await createThreadSession(source, threadId, sessionId);
           console.log(`[${new Date().toLocaleTimeString()}] Thread session created: ${sessionId} (thread ${threadId.slice(0, 8)})`);
         } else {
-          await createSession(sessionId);
+          await createSession(sessionId, cwd);
           console.log(`[${new Date().toLocaleTimeString()}] Session created: ${sessionId}`);
         }
       } catch (e) {
@@ -1047,7 +1047,7 @@ async function execClaude(
       });
 
       if (retryExec.exitCode === 0) {
-        const count = threadId ? await incrementThreadTurn(source, threadId) : await incrementTurn();
+        const count = threadId ? await incrementThreadTurn(source, threadId) : await incrementTurn(cwd);
         console.log(`[${new Date().toLocaleTimeString()}] Turn count: ${count} (after compact + retry)`);
       }
       return retryResult;
@@ -1056,14 +1056,14 @@ async function execClaude(
 
   // --- Turn tracking & compact warning ---
   if (exitCode === 0 && !isNew) {
-    const turnCount = threadId ? await incrementThreadTurn(source, threadId) : await incrementTurn();
+    const turnCount = threadId ? await incrementThreadTurn(source, threadId) : await incrementTurn(cwd);
     console.log(`[${new Date().toLocaleTimeString()}] Turn count: ${turnCount}${threadId ? ` (thread ${threadId.slice(0, 8)})` : ""}`);
 
     if (turnCount >= COMPACT_WARN_THRESHOLD && existing && !existing.compactWarned) {
       if (threadId) {
         await markThreadCompactWarned(source, threadId);
       } else {
-        await markCompactWarned();
+        await markCompactWarned(cwd);
       }
       emitCompactEvent({ type: "warn", turnCount });
     }

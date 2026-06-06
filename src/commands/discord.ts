@@ -641,7 +641,7 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
     }
 
     if (interaction.data.name === "reset") {
-      await resetSession();
+      await resetSession(interaction.channel_id ? resolveChannelCwd(interaction.channel_id) : process.cwd());
       await respondToInteraction(interaction, {
         content: "Global session reset. Next message starts fresh.",
       });
@@ -670,7 +670,7 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
     }
 
     if (interaction.data.name === "status") {
-      const session = await peekSession();
+      const session = await peekSession(interaction.channel_id ? resolveChannelCwd(interaction.channel_id) : process.cwd());
       const settings = getSettings();
       if (!session) {
         await respondToInteraction(interaction, { content: "📊 No active session." });
@@ -701,13 +701,14 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
     }
 
     if (interaction.data.name === "context") {
-      const session = await peekSession();
+      const contextCwd = interaction.channel_id ? resolveChannelCwd(interaction.channel_id) : process.cwd();
+      const session = await peekSession(contextCwd);
       if (!session) {
         await respondToInteraction(interaction, { content: "No active session." });
         return;
       }
       const home = homedir();
-      const projectSlug = projectSlugFromCwd();
+      const projectSlug = projectSlugFromCwd(contextCwd);
       const jsonlPath = `${home}/.claude/projects/${projectSlug}/${session.sessionId}.jsonl`;
       if (!existsSync(jsonlPath)) {
         await respondToInteraction(interaction, { content: "Conversation file not found." });
