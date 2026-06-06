@@ -14,6 +14,8 @@
  */
 
 import { join } from "node:path";
+import { homedir } from "node:os";
+import { claudeProjectMemoryDir } from "./runtime/claude-paths";
 
 export const HERMES_DIR_NAME = "hermes";
 export const LEGACY_DIR_NAME = "claudeclaw";
@@ -76,8 +78,20 @@ export function whisperDir(cwd: string = process.cwd()): string {
   return join(hermesDir(cwd), "whisper");
 }
 
+// Hermes memory now lives in Claude Code's native auto-memory location
+// (`~/.claude/projects/<slug>/memory/`) so it persists independently of the
+// plugin and unifies with the harness auto-memory the agent already loads at
+// session start. Everything derived from memoryDir() (USER/MEMORY/SOUL/
+// IDENTITY/channels, blocks/, journal/) follows automatically.
+//
+// Home is read from $HOME first (always set for the daemon, and overridable by
+// tests) since bun's os.homedir() ignores process.env.HOME.
+function effectiveHome(): string {
+  return process.env.HOME ?? homedir();
+}
+
 export function memoryDir(cwd: string = process.cwd()): string {
-  return join(cwd, "memory");
+  return claudeProjectMemoryDir(effectiveHome(), cwd);
 }
 
 /** Legacy memory directory under `.claude/hermes/memory/` — only referenced by the migrator. */

@@ -19,25 +19,38 @@ import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { claudeProjectMemoryDir } from "../runtime/claude-paths";
 
 const ORIG_CWD = process.cwd();
+const ORIG_HOME = process.env.HOME;
 let tempRoot: string;
+let tempHome: string;
 let blocksDir: string;
 let memoryDir: string;
 let blocks: any;
 
 beforeAll(async () => {
   tempRoot = await fs.mkdtemp(join(tmpdir(), "hermes-blocks-"));
-  memoryDir = join(tempRoot, "memory");
+  // Hermes memory now lives under Claude Code's auto-memory dir, derived from
+  // $HOME — isolate it to a temp home so the suite never touches real ~/.claude.
+  tempHome = await fs.mkdtemp(join(tmpdir(), "hermes-blocks-home-"));
+  process.env.HOME = tempHome;
+  process.chdir(tempRoot);
+  // Derive the memory dir from process.cwd() (which may differ from tempRoot
+  // when tmpdir is a symlink, e.g. /var -> /private/var on macOS) so it matches
+  // exactly what the blocks module resolves from process.cwd().
+  memoryDir = claudeProjectMemoryDir(tempHome, process.cwd());
   blocksDir = join(memoryDir, "blocks");
   await fs.mkdir(memoryDir, { recursive: true });
-  process.chdir(tempRoot);
   blocks = await import("./blocks");
 });
 
 afterAll(async () => {
   process.chdir(ORIG_CWD);
+  if (ORIG_HOME === undefined) delete process.env.HOME;
+  else process.env.HOME = ORIG_HOME;
   await fs.rm(tempRoot, { recursive: true, force: true });
+  await fs.rm(tempHome, { recursive: true, force: true });
 });
 
 beforeEach(async () => {
@@ -236,8 +249,9 @@ describe("path-traversal guardrails", () => {
 
   for (const bad of invalidNames) {
     test(`writeBlock(${JSON.stringify(bad)}) refuses to write outside the blocks dir`, async () => {
-      // Snapshot the tempRoot tree so we can diff after the (expected) throw.
-      const before = await listTree(tempRoot);
+      // Snapshot the temp home tree (which contains the blocks dir) so we can
+      // diff after the (expected) throw.
+      const before = await listTree(tempHome);
 
       let caught: unknown;
       try {
@@ -250,7 +264,7 @@ describe("path-traversal guardrails", () => {
       expect(msg.includes("name") || msg.includes("invalid")).toBe(true);
 
       // No file should have appeared anywhere outside the (possibly absent) blocks dir.
-      const after = await listTree(tempRoot);
+      const after = await listTree(tempHome);
       const newPaths = after.filter((p) => !before.includes(p));
       for (const p of newPaths) {
         expect(p.startsWith(blocksDir)).toBe(true);

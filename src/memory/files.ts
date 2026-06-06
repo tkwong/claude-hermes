@@ -118,7 +118,9 @@ export async function migrateLegacyMemory(
 
   const moved = new Set<string>();
   const skipped = new Set<string>();
-  for (const sourceRoot of sourceRoots) {
+  // memoryDir() now resolves to the Claude Code auto-memory dir, which is also
+  // one of the sources above — never migrate a directory into itself.
+  for (const sourceRoot of sourceRoots.filter((s) => s !== newRoot)) {
     const result = await migrateMemoryTree(sourceRoot, newRoot);
     for (const rel of result.moved) moved.add(rel);
     for (const rel of result.skipped) {

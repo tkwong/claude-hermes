@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { readFile, readdir } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
+import { claudeProjectMemoryDir } from "./runtime/claude-paths";
 import {
   HERMES_DIR_NAME,
   LEGACY_DIR_NAME,
@@ -69,14 +71,17 @@ describe("path constants", () => {
     expect(migrationMarkerFile(root)).toBe(join(root, ".claude", "hermes", "MIGRATED.json"));
   });
 
-  test("memory paths live under <cwd>/memory (project root, not .claude/hermes)", () => {
+  test("memory paths live under the Claude Code auto-memory dir (~/.claude/projects/<slug>/memory)", () => {
     const root = "/tmp/m";
-    expect(memoryDir(root)).toBe(join(root, "memory"));
-    expect(userMemoryFile(root)).toBe(join(root, "memory", "USER.md"));
-    expect(crossSessionMemoryFile(root)).toBe(join(root, "memory", "MEMORY.md"));
-    expect(soulMemoryFile(root)).toBe(join(root, "memory", "SOUL.md"));
-    expect(identityMemoryFile(root)).toBe(join(root, "memory", "IDENTITY.md"));
-    expect(channelMemoryFile("abc", root)).toBe(join(root, "memory", "channels", "abc.md"));
+    // Hermes memory now lives in Claude Code's native auto-memory location,
+    // derived from $HOME (or os.homedir() as a fallback) and the project slug.
+    const base = claudeProjectMemoryDir(process.env.HOME ?? homedir(), root);
+    expect(memoryDir(root)).toBe(base);
+    expect(userMemoryFile(root)).toBe(join(base, "USER.md"));
+    expect(crossSessionMemoryFile(root)).toBe(join(base, "MEMORY.md"));
+    expect(soulMemoryFile(root)).toBe(join(base, "SOUL.md"));
+    expect(identityMemoryFile(root)).toBe(join(base, "IDENTITY.md"));
+    expect(channelMemoryFile("abc", root)).toBe(join(base, "channels", "abc.md"));
   });
 
   test("legacyMemoryDir exposes the old .claude/hermes/memory path for the migrator", () => {

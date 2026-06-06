@@ -2,21 +2,36 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { claudeProjectMemoryDir } from "../runtime/claude-paths";
 
 const ORIG_CWD = process.cwd();
+const ORIG_HOME = process.env.HOME;
 let tempRoot: string;
+let tempHome: string;
+let memoryDir: string;
 let mem: typeof import("./index");
 
 beforeAll(async () => {
   tempRoot = await fs.mkdtemp(join(tmpdir(), "hermes-memory-"));
-  await fs.mkdir(join(tempRoot, "memory"), { recursive: true });
+  // Memory now lives under Claude Code's auto-memory dir (derived from $HOME).
+  // Isolate $HOME to a temp dir so the layer files land where the reader looks.
+  tempHome = await fs.mkdtemp(join(tmpdir(), "hermes-memory-home-"));
+  process.env.HOME = tempHome;
   process.chdir(tempRoot);
+  // Derive the memory dir from process.cwd() (which may differ from tempRoot
+  // when tmpdir is a symlink, e.g. /var -> /private/var on macOS) so it matches
+  // exactly what the memory readers/writers resolve from process.cwd().
+  memoryDir = claudeProjectMemoryDir(tempHome, process.cwd());
+  await fs.mkdir(memoryDir, { recursive: true });
   mem = await import("./index");
 });
 
 afterAll(async () => {
   process.chdir(ORIG_CWD);
+  if (ORIG_HOME === undefined) delete process.env.HOME;
+  else process.env.HOME = ORIG_HOME;
   await fs.rm(tempRoot, { recursive: true, force: true });
+  await fs.rm(tempHome, { recursive: true, force: true });
 });
 
 describe("memory files", () => {
@@ -53,8 +68,8 @@ describe("memory files", () => {
 
 describe("system prompt composition", () => {
   test("concatenates present layers in SOUL→IDENTITY→USER→MEMORY→CHANNEL order", async () => {
-    await fs.writeFile(join(tempRoot, "memory", "SOUL.md"), "SOUL-text");
-    await fs.writeFile(join(tempRoot, "memory", "IDENTITY.md"), "ID-text");
+    await fs.writeFile(join(memoryDir, "SOUL.md"), "SOUL-text");
+    await fs.writeFile(join(memoryDir, "IDENTITY.md"), "ID-text");
     await mem.writeUserMemory("USER-text");
     await mem.appendCrossSessionMemory("MEM-fact");
     await mem.writeChannelMemory("CX", "CHANNEL-play");

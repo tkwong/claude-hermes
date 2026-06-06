@@ -10,23 +10,37 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:tes
 import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { claudeProjectMemoryDir } from "../runtime/claude-paths";
 
 const ORIG_CWD = process.cwd();
+const ORIG_HOME = process.env.HOME;
 let tempRoot: string;
+let tempHome: string;
 let memoryDir: string;
 let mem: typeof import("./index");
 
 beforeAll(async () => {
   tempRoot = await fs.mkdtemp(join(tmpdir(), "hermes-compose-"));
-  memoryDir = join(tempRoot, "memory");
-  await fs.mkdir(memoryDir, { recursive: true });
+  // Memory layers now resolve under Claude Code's auto-memory dir (derived
+  // from $HOME). Isolate $HOME to a temp dir so the layers the composer reads
+  // are the same ones the test writes.
+  tempHome = await fs.mkdtemp(join(tmpdir(), "hermes-compose-home-"));
+  process.env.HOME = tempHome;
   process.chdir(tempRoot);
+  // Derive the memory dir from process.cwd() (which may differ from tempRoot
+  // when tmpdir is a symlink, e.g. /var -> /private/var on macOS) so it matches
+  // exactly what the composer resolves from process.cwd() at read time.
+  memoryDir = claudeProjectMemoryDir(tempHome, process.cwd());
+  await fs.mkdir(memoryDir, { recursive: true });
   mem = await import("./index");
 });
 
 afterAll(async () => {
   process.chdir(ORIG_CWD);
+  if (ORIG_HOME === undefined) delete process.env.HOME;
+  else process.env.HOME = ORIG_HOME;
   await fs.rm(tempRoot, { recursive: true, force: true });
+  await fs.rm(tempHome, { recursive: true, force: true });
 });
 
 beforeEach(async () => {

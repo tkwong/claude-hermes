@@ -3,15 +3,22 @@ import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { claudeProjectMemoryDir } from "../runtime/claude-paths";
 import { applyMigrations, closeDb, type Database, eventsRepo, openDb } from "../state";
 import { journalFile, recordEvent } from "./journal";
 
 const ORIG_CWD = process.cwd();
+const ORIG_HOME = process.env.HOME;
 let tempRoot: string;
+let tempHome: string;
 let db: Database;
 
 beforeAll(async () => {
   tempRoot = await mkdtemp(join(tmpdir(), "hermes-evolve-journal-"));
+  // The journal now lives under Claude Code's auto-memory dir (derived from
+  // $HOME). Isolate $HOME so journal files land in a temp tree.
+  tempHome = await mkdtemp(join(tmpdir(), "hermes-evolve-journal-home-"));
+  process.env.HOME = tempHome;
   process.chdir(tempRoot);
   db = openDb({ path: ":memory:" });
   await applyMigrations(db);
@@ -20,7 +27,10 @@ beforeAll(async () => {
 afterAll(async () => {
   closeDb(db);
   process.chdir(ORIG_CWD);
+  if (ORIG_HOME === undefined) delete process.env.HOME;
+  else process.env.HOME = ORIG_HOME;
   await rm(tempRoot, { recursive: true, force: true });
+  await rm(tempHome, { recursive: true, force: true });
 });
 
 beforeEach(() => {
@@ -39,7 +49,13 @@ describe("journalFile", () => {
   test("uses the provided cwd when given", () => {
     const date = new Date("2026-04-16T00:00:00Z");
     const path = journalFile(date, "/custom/cwd");
-    expect(path.startsWith("/custom/cwd") || path.startsWith("\\custom\\cwd")).toBe(true);
+    // The journal now lives under the Claude Code auto-memory dir derived from
+    // the given cwd (its project slug), not as a literal cwd prefix.
+    const expectedBase = join(claudeProjectMemoryDir(tempHome, "/custom/cwd"), "journal");
+    expect(path.startsWith(expectedBase)).toBe(true);
+    // The provided cwd must still influence the path (distinct cwd -> distinct
+    // journal location) — a different cwd resolves to a different file.
+    expect(path).not.toBe(journalFile(date, "/other/cwd"));
   });
 
   test("different dates produce different filenames", () => {

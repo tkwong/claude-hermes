@@ -27,8 +27,11 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rmWithRetry } from "../../tests/helpers/rm-with-retry";
+import { claudeProjectMemoryDir } from "../runtime/claude-paths";
 
 const ORIG_CWD = process.cwd();
+const ORIG_HOME = process.env.HOME;
+let tempHome: string;
 
 const MIN_SETTINGS = {
   model: "",
@@ -51,6 +54,11 @@ let sessionsRepo: typeof import("../state/repos/sessions");
 let paths: typeof import("../paths");
 
 beforeAll(async () => {
+  // Memory (MEMORY.md, journal, …) now resolves under Claude Code's auto-memory
+  // dir derived from $HOME. Isolate $HOME so the dream pass reads/writes the
+  // MEMORY.md the tests seed via paths.crossSessionMemoryFile(ws.dir).
+  tempHome = mkdtempSync(join(tmpdir(), "hermes-dream-home-"));
+  process.env.HOME = tempHome;
   tempRoot = mkdtempSync(join(tmpdir(), "hermes-dream-"));
   mkdirSync(join(tempRoot, ".claude", "hermes", "logs"), { recursive: true });
   writeFileSync(join(tempRoot, ".claude", "hermes", "settings.json"), JSON.stringify(MIN_SETTINGS, null, 2));
@@ -65,7 +73,10 @@ beforeAll(async () => {
 afterAll(async () => {
   await shared.resetSharedDbCache();
   process.chdir(ORIG_CWD);
+  if (ORIG_HOME === undefined) delete process.env.HOME;
+  else process.env.HOME = ORIG_HOME;
   await rmWithRetry(tempRoot);
+  await rmWithRetry(tempHome);
 });
 
 interface ColumnInfo {
@@ -89,7 +100,8 @@ interface IsolatedWorkspace {
 async function makeWorkspace(prefix: string): Promise<IsolatedWorkspace> {
   const dir = mkdtempSync(join(tmpdir(), `hermes-dream-${prefix}-`));
   mkdirSync(join(dir, ".claude", "hermes", "logs"), { recursive: true });
-  mkdirSync(join(dir, "memory"), { recursive: true });
+  // MEMORY.md lives under the Claude Code auto-memory dir derived from $HOME.
+  mkdirSync(claudeProjectMemoryDir(tempHome, dir), { recursive: true });
   writeFileSync(join(dir, ".claude", "hermes", "settings.json"), JSON.stringify(MIN_SETTINGS, null, 2));
   process.chdir(dir);
   const db = await shared.getSharedDb();

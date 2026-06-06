@@ -1,8 +1,9 @@
 /**
  * Agent-writable memory protocol matching Anthropic's `memory_20250818` tool
- * shape. All operations are scoped to:
+ * shape. All operations are scoped to (via memoryDir, now Claude Code's
+ * native auto-memory location):
  *
- *   <cwd>/memory/agent/
+ *   <claude-home>/.claude/projects/<slug>/memory/agent/
  *
  * Six ops: view, create, strReplace, insert, del, rename. Every path goes
  * through `resolveAgentPath`, which is the single gatekeeper that validates
@@ -18,8 +19,7 @@
 import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, rename as fsRename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-
-const AGENT_SUBPATH = ["memory", "agent"];
+import { memoryDir } from "../paths";
 
 export interface ViewDirResult {
   kind: "dir";
@@ -34,7 +34,7 @@ export interface ViewFileResult {
 export type ViewResult = ViewDirResult | ViewFileResult;
 
 function agentRootFor(cwd?: string): string {
-  return resolve(cwd ?? process.cwd(), ...AGENT_SUBPATH);
+  return join(memoryDir(cwd), "agent");
 }
 
 function invalidPath(input: string): Error {

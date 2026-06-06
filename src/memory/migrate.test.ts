@@ -21,7 +21,7 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { projectSlugFromCwd } from "../runtime/claude-paths";
+import { claudeProjectMemoryDir, projectSlugFromCwd } from "../runtime/claude-paths";
 
 type MigrateResult = { moved: string[]; skipped: string[] };
 type Migrator = (cwd: string, opts?: { home?: string }) => Promise<MigrateResult>;
@@ -44,7 +44,9 @@ async function loadMigrator(): Promise<Migrator> {
   throw new Error("migrateLegacyMemory is not exported from src/memory/files.ts nor src/memory/migrate.ts");
 }
 
+const ORIG_HOME = process.env.HOME;
 let tmp: string;
+let tempHome: string;
 let legacy: string;
 let neo: string;
 let fakeHome: string;
@@ -52,14 +54,23 @@ let claudeProjectsLegacy: string;
 
 beforeEach(async () => {
   tmp = await mkdtemp(join(tmpdir(), "hermes-mem-migrate-"));
+  // memoryDir() (the migration target) now resolves under the Claude Code
+  // auto-memory dir derived from $HOME. Isolate $HOME to a temp dir distinct
+  // from `fakeHome` so the auto-memory SOURCE and the migration TARGET are
+  // different directories (otherwise the migrator skips same-dir sources).
+  tempHome = await mkdtemp(join(tmpdir(), "hermes-mem-migrate-home-"));
+  process.env.HOME = tempHome;
   legacy = join(tmp, ".claude", "hermes", "memory");
-  neo = join(tmp, "memory");
+  neo = claudeProjectMemoryDir(tempHome, tmp);
   fakeHome = join(tmp, "home");
   claudeProjectsLegacy = join(fakeHome, ".claude", "projects", projectSlugFromCwd(tmp), "memory");
 });
 
 afterEach(async () => {
+  if (ORIG_HOME === undefined) delete process.env.HOME;
+  else process.env.HOME = ORIG_HOME;
   await rm(tmp, { recursive: true, force: true });
+  await rm(tempHome, { recursive: true, force: true });
 });
 
 describe("migrateLegacyMemory — branches", () => {

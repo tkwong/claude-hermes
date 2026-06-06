@@ -24,25 +24,39 @@ import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { claudeProjectMemoryDir } from "../runtime/claude-paths";
 
 const ORIG_CWD = process.cwd();
+const ORIG_HOME = process.env.HOME;
 let tempRoot: string;
+let tempHome: string;
 let memoryDir: string;
 let agentDir: string;
 let mem: any;
 
 beforeAll(async () => {
   tempRoot = await fs.mkdtemp(join(tmpdir(), "hermes-agent-mem-"));
-  memoryDir = join(tempRoot, "memory");
+  // Hermes memory now lives under Claude Code's auto-memory dir, which is
+  // derived from $HOME. Isolate it to a temp home so the suite doesn't touch
+  // the real ~/.claude tree.
+  tempHome = await fs.mkdtemp(join(tmpdir(), "hermes-agent-mem-home-"));
+  process.env.HOME = tempHome;
+  process.chdir(tempRoot);
+  // Derive the memory dir from process.cwd() (which may differ from tempRoot
+  // when tmpdir is a symlink, e.g. /var -> /private/var on macOS) so it matches
+  // exactly what agent-memory resolves from process.cwd().
+  memoryDir = claudeProjectMemoryDir(tempHome, process.cwd());
   agentDir = join(memoryDir, "agent");
   await fs.mkdir(memoryDir, { recursive: true });
-  process.chdir(tempRoot);
   mem = await import("./agent-memory");
 });
 
 afterAll(async () => {
   process.chdir(ORIG_CWD);
+  if (ORIG_HOME === undefined) delete process.env.HOME;
+  else process.env.HOME = ORIG_HOME;
   await fs.rm(tempRoot, { recursive: true, force: true });
+  await fs.rm(tempHome, { recursive: true, force: true });
 });
 
 beforeEach(async () => {
@@ -135,7 +149,7 @@ describe("create", () => {
     ];
 
     for (const bad of bads) {
-      const before = await listTree(tempRoot);
+      const before = await listTree(tempHome);
 
       let caught: unknown;
       try {
@@ -148,7 +162,7 @@ describe("create", () => {
       expect(msg.includes("path") || msg.includes("invalid")).toBe(true);
 
       // No new path appeared anywhere outside the agent root.
-      const after = await listTree(tempRoot);
+      const after = await listTree(tempHome);
       const newPaths = after.filter((p) => !before.includes(p));
       for (const p of newPaths) {
         expect(p === agentDir || p.startsWith(agentDir + require("node:path").sep)).toBe(true);
@@ -341,7 +355,7 @@ describe("rename", () => {
 
   test("rename with newPath outside the agent root throws and creates nothing outside", async () => {
     await mem.create("a.md", "x");
-    const before = await listTree(tempRoot);
+    const before = await listTree(tempHome);
 
     let caught: unknown;
     try {
@@ -358,7 +372,7 @@ describe("rename", () => {
     expect(stillThere).toEqual({ kind: "file", content: "x" });
 
     // No path appeared outside the agent root.
-    const after = await listTree(tempRoot);
+    const after = await listTree(tempHome);
     const newPaths = after.filter((p) => !before.includes(p));
     for (const p of newPaths) {
       expect(p === agentDir || p.startsWith(agentDir + require("node:path").sep)).toBe(true);
@@ -406,8 +420,9 @@ describe("invariant: nothing escapes the agent root", () => {
     const sibling = join(memoryDir, "SIBLING.md");
     await fs.writeFile(sibling, "untouched", "utf8");
 
-    // Snapshot the entire tempRoot before our op sequence.
-    const before = await listTree(tempRoot);
+    // Snapshot the entire temp home tree (which contains the agent root)
+    // before our op sequence.
+    const before = await listTree(tempHome);
 
     // 1. Create a couple files (one nested).
     await mem.create("notes.md", "hello world");
@@ -451,7 +466,7 @@ describe("invariant: nothing escapes the agent root", () => {
     }
 
     // Final snapshot: every newly-touched path must live under the agent root.
-    const after = await listTree(tempRoot);
+    const after = await listTree(tempHome);
     const newPaths = after.filter((p) => !before.includes(p));
     for (const p of newPaths) {
       expect(p === agentDir || p.startsWith(agentDir + require("node:path").sep)).toBe(true);
