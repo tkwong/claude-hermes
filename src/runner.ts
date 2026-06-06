@@ -451,6 +451,18 @@ function dirScopePrompt(cwd: string = process.cwd()): string {
   ].join("\n");
 }
 
+/**
+ * Anti-hallucination guardrail appended to every run. The daemon answers
+ * questions about its own internals (Hermes, Claude Code, configs, code)
+ * where confidently-wrong guesses are costly — force verification first.
+ */
+function verifyBeforeAssertPrompt(): string {
+  return [
+    "VERIFY BEFORE YOU ASSERT: When asked how this system works — Hermes, Claude Code, this codebase, configs, or whether something needs a restart/setting/file — do NOT answer from memory or from your own injected system prompt. First READ the relevant source or config file, or run a command to check, then answer from what you actually observed.",
+    "If you cannot verify a claim, say so explicitly and state your uncertainty rather than guessing. Never present an unverified claim about the system's behaviour as fact.",
+  ].join("\n");
+}
+
 export async function ensureProjectClaudeMd(): Promise<void> {
   const projectClaudeMd = projectClaudeMdFile();
   const legacyClaudeMd = legacyProjectClaudeMdFile();
@@ -776,6 +788,9 @@ async function execClaude(
     args.push("--resume", existing.sessionId);
   }
 
+  // Thinking effort (e.g. "xhigh") — applies to both new and resumed runs.
+  if (settings.effort) args.push("--effort", settings.effort);
+
   // Build the appended system prompt: prompt files + directory scoping
   // This is passed on EVERY invocation (not just new sessions) because
   // --append-system-prompt does not persist across --resume.
@@ -830,6 +845,7 @@ async function execClaude(
     console.error(`[${new Date().toLocaleTimeString()}] Failed to compose runtime memory layer:`, e);
   }
 
+  appendParts.push(verifyBeforeAssertPrompt());
   if (security.level !== "unrestricted") appendParts.push(dirScopePrompt(cwd));
   if (appendParts.length > 0) {
     args.push("--append-system-prompt", appendParts.join("\n\n"));

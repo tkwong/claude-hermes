@@ -166,6 +166,17 @@ describe("loadSettings / reloadSettings", () => {
     expect(defaults.discord.channelDirectories).toEqual({});
   });
 
+  test("parses top-level effort only for valid levels, else undefined", async () => {
+    await writeSettings(`{ "effort": "max" }`);
+    expect((await config.reloadSettings()).effort).toBe("max");
+    await writeSettings(`{ "effort": "xhigh" }`);
+    expect((await config.reloadSettings()).effort).toBe("xhigh");
+    await writeSettings(`{ "effort": "turbo" }`);
+    expect((await config.reloadSettings()).effort).toBeUndefined();
+    await writeSettings(`{}`);
+    expect((await config.reloadSettings()).effort).toBeUndefined();
+  });
+
   test("plugins.preflightOnStart defaults to false (off unless explicitly enabled)", async () => {
     await config.initConfig();
     const settings = await config.reloadSettings();

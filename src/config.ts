@@ -112,9 +112,12 @@ export interface SecurityConfig {
   bypassPermissions: boolean;
 }
 
+export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
+
 export interface Settings {
   model: string;
   api: string;
+  effort?: EffortLevel; // Passed to `claude --effort`; unset = CLI default
   fallback: ModelConfig;
   agentic: AgenticConfig;
   timezone: string;
@@ -299,6 +302,10 @@ function parseSettings(raw: Record<string, any>, discordUserIdsRaw: string[] = [
   return {
     model: typeof raw.model === "string" ? raw.model.trim() : "",
     api: typeof raw.api === "string" ? raw.api.trim() : "",
+    effort:
+      raw.effort === "low" || raw.effort === "medium" || raw.effort === "high" || raw.effort === "xhigh" || raw.effort === "max"
+        ? raw.effort
+        : undefined,
     fallback: {
       model: typeof raw.fallback?.model === "string" ? raw.fallback.model.trim() : "",
       api: typeof raw.fallback?.api === "string" ? raw.fallback.api.trim() : "",
