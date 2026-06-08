@@ -104,8 +104,9 @@ describe("session supervisor (stubbed spawn)", () => {
     const newSession = calls.find((c) => c.args[0] === "new-session");
     expect(newSession).toBeDefined();
     const joined = newSession?.args.join(" ") ?? "";
-    expect(joined).toContain("--dangerously-load-development-channels");
     expect(joined).toContain("--channels");
+    expect(joined).toContain("plugin:discord@claude-plugins-official");
+    expect(joined).toContain("--dangerously-skip-permissions");
     expect(newSession?.env?.HERMES_SESSION_KEY).toBe("workspace:abc123");
     expect(newSession?.env?.HERMES_BROKER_SOCK).toContain("broker.sock");
     expect(typeof newSession?.env?.HERMES_TOKEN).toBe("string");

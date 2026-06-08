@@ -649,9 +649,18 @@ export async function start(args: string[] = []) {
   async function startBroker(): Promise<void> {
     if (brokerIpc) return; // idempotent (hot-reload may re-enter)
     const { openInbox, inboxDbFile, closeInbox } = await import("../broker/inbox");
-    const { createSessionSupervisor } = await import("../broker/sessions");
+    const { createSessionSupervisor, installChannelShim } = await import("../broker/sessions");
     const { startBrokerIpc, brokerSockPath } = await import("../broker/ipc");
     const { brokerReply, sendMessageToUser } = await import("./discord");
+
+    // Masquerade-install our channel shim into the allowlisted discord plugin so
+    // lanes can launch via `--channels plugin:discord@claude-plugins-official`
+    // with NO interactive dev-channels confirmation prompt. Idempotent; re-runs
+    // each bring-up so the masqueraded copy tracks the repo shim.
+    const installed = installChannelShim();
+    console.log(
+      `[${ts()}] [broker] channel shim ${installed ? `installed → ${installed}` : "NOT installed (discord plugin not cached — lanes will fail)"}`,
+    );
 
     const inboxDb = openInbox(inboxDbFile());
     const sockPath = brokerSockPath();
