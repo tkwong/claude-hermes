@@ -17,6 +17,7 @@ import { createDiscordStatusSink, type DiscordTransport } from "../status/sinks/
 import { DISCORD_API, discordApi } from "./discord-api";
 import { buildSlashCommandList } from "./slash-commands";
 import { classifyThreadIntent } from "./discord-intent";
+import { threadKey, workspaceKey } from "../router/session-key";
 
 // --- Discord API constants ---
 
@@ -230,6 +231,66 @@ export async function sendReaction(
     "PUT",
     `/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}/@me`,
   );
+}
+
+/**
+ * Broker egress callback (Phase-1). The broker's IPC server hands every shim
+ * `reply` frame here; this is the SAME egress as the metered path
+ * (`sendMessage` with chunking + `[react:]` stripping), so the broker never
+ * re-implements that logic.
+ *
+ * Re-validates `chatId` against the bot's own routing allowlist before sending:
+ * a session may only reply to a channel it is actually wired to. The allowlist
+ * is the union of `channelDirectories` keys (mapped channels) + the configured
+ * `listenChannels` + any known thread channel (whose parent is mapped). An
+ * unrecognised `chatId` throws an `allowlist`-tagged error so ipc.ts maps it to
+ * the `chat_id not allowlisted` reply_ack — the session never exfiltrates to an
+ * arbitrary channel by minting a foreign chat_id.
+ *
+ * ALSO enforces per-session ownership: the replying `sessionKey` must be the one
+ * that owns `chatId` (the same sessionKey execClaude derives for that channel /
+ * thread). This stops lane A from replying into lane B's channel even when both
+ * are globally allowlisted (the contract's "a session may only reply to its own
+ * allowlisted channels"). For a thread, ownership = `threadKey('discord',chatId)`;
+ * for a plain channel, ownership = `workspaceKey(resolveChannelCwd(chatId))`.
+ *
+ * `reply_to` is accepted for the schema but threaded replies are Phase-2; for
+ * now it is logged and the message goes to the channel directly.
+ */
+export async function brokerReply(
+  sessionKey: string,
+  chatId: string,
+  text: string,
+  replyTo?: string,
+): Promise<void> {
+  const config = getSettings().discord;
+  if (!config.token) {
+    throw new Error("brokerReply: Discord token not configured");
+  }
+  const mapped = new Set<string>(Object.keys(config.channelDirectories ?? {}));
+  for (const ch of config.listenChannels) mapped.add(ch);
+  const parentId = knownThreads.get(chatId)?.parentId;
+  const allowed =
+    mapped.has(chatId) || (parentId !== undefined && mapped.has(parentId)) || knownThreads.has(chatId);
+  if (!allowed) {
+    throw new Error(`brokerReply: chat_id ${chatId} not allowlisted (no channelDirectories/listenChannels/thread match)`);
+  }
+  // Per-session ownership: the chatId must map back to the SAME sessionKey the
+  // runner would mint for it. A thread is its own lane; a plain channel shares a
+  // workspace lane keyed on its resolved cwd. Mismatch = cross-lane reply.
+  const isThread = knownThreads.has(chatId);
+  const ownerKey = isThread
+    ? threadKey("discord", chatId)
+    : workspaceKey(resolveChannelCwd(chatId));
+  if (ownerKey !== sessionKey) {
+    throw new Error(
+      `brokerReply: chat_id ${chatId} not allowlisted for session ${sessionKey} (owner ${ownerKey})`,
+    );
+  }
+  if (replyTo) {
+    debugLog(`brokerReply: reply_to=${replyTo} ignored (threaded replies are Phase-2)`);
+  }
+  await sendMessage(config.token, chatId, text);
 }
 
 // --- Reaction directive extraction (same as telegram.ts) ---
@@ -600,6 +661,10 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
 
     if (result.exitCode !== 0) {
       await sendMessage(config.token, channelId, `Error (exit ${result.exitCode}): ${result.stderr || result.stdout || "Unknown error"}`);
+    } else if (result.stdout === "" && config.useBrokerSessions) {
+      // Broker lane ack-only sentinel: egress already happened via
+      // shim->broker->brokerReply. Sending here would double-deliver. The flag
+      // guard keeps this from swallowing a genuinely empty metered response.
     } else {
       const visibleText = extractSessionAndResultFromText(result.stdout || "").result ?? result.stdout ?? "";
       const { cleanedText, reactionEmoji } = extractReactionDirective(visibleText);

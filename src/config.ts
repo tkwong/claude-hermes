@@ -54,7 +54,7 @@ const DEFAULT_SETTINGS: Settings = {
     forwardToDiscord: false,
   },
   telegram: { token: "", allowedUserIds: [] },
-  discord: { token: "", allowedUserIds: [], listenChannels: [], statusChannelId: "", channelDirectories: {} },
+  discord: { token: "", allowedUserIds: [], listenChannels: [], statusChannelId: "", channelDirectories: {}, useBrokerSessions: false },
   security: { level: "moderate", allowedTools: [], disallowedTools: [], bypassPermissions: false },
   stt: { baseUrl: "", model: "" },
   plugins: { preflightOnStart: false },
@@ -89,6 +89,13 @@ export interface DiscordConfig {
   listenChannels: string[]; // Channel IDs where bot responds to all messages (no mention needed)
   statusChannelId?: string; // Channel ID where live job/heartbeat status messages are posted
   channelDirectories?: Record<string, string>; // Channel ID → project working directory (cwd) for that channel's Claude runs
+  /**
+   * Phase-1 broker: route Discord runs to long-running interactive
+   * `claude --channels` sessions (subscription-billed) via the broker+shim
+   * instead of the metered `claude -p --resume` path. Default false =
+   * existing metered path = instant rollback lever.
+   */
+  useBrokerSessions?: boolean;
 }
 
 export type SecurityLevel =
@@ -349,6 +356,7 @@ function parseSettings(raw: Record<string, any>, discordUserIdsRaw: string[] = [
                 .map(([k, v]) => [String(k), String(v)]),
             )
           : {},
+      useBrokerSessions: raw.discord?.useBrokerSessions === true,
     },
     security: {
       level,

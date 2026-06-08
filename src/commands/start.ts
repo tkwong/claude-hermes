@@ -23,7 +23,9 @@ import {
   loadHeartbeatPromptTemplate,
   run,
   runUserMessage,
+  setBrokerIpc,
 } from "../runner";
+import type { BrokerIpc } from "../broker/ipc";
 import { type StateData, writeState } from "../statusline";
 import { createJobStatusSink } from "../status/job-sink";
 import { maybeRunDream } from "../memory/dream-scheduler";
@@ -550,9 +552,14 @@ export async function start(args: string[] = []) {
     console.warn(`[${ts()}] Failed to register daemon: ${err instanceof Error ? err.message : err}`);
   });
   let discordStopGateway: (() => void) | null = null;
+  // Phase-1 broker handle + supervisor shutdown. Null unless
+  // discord.useBrokerSessions is true (default off = metered path only).
+  let brokerIpc: BrokerIpc | null = null;
+  let brokerShutdown: (() => Promise<void>) | null = null;
 
   async function shutdown() {
     if (discordStopGateway) discordStopGateway();
+    if (brokerShutdown) await brokerShutdown().catch(() => {});
     await teardownStatusline();
     await unregisterDaemon(process.pid).catch(() => {});
     await cleanupPidFile();
@@ -632,6 +639,68 @@ export async function start(args: string[] = []) {
 
   await initDiscord(currentSettings.discord.token);
   if (!discordToken) console.log("  Discord: not configured");
+
+  // --- Phase-1 broker (subscription-billed `claude --channels` sessions) ---
+  // Only spun up when discord.useBrokerSessions is true (default off). Bring-up
+  // order breaks the runner<->broker cycle: openInbox -> createSessionSupervisor
+  // -> startBrokerIpc({..., onReply: brokerReply}) -> setBrokerIpc(ipc). The
+  // runner reaches the broker via getBrokerIpc() only. Egress reuses Hermes's
+  // own sendMessage (via brokerReply) — the broker never re-implements it.
+  async function startBroker(): Promise<void> {
+    if (brokerIpc) return; // idempotent (hot-reload may re-enter)
+    const { openInbox, inboxDbFile, closeInbox } = await import("../broker/inbox");
+    const { createSessionSupervisor } = await import("../broker/sessions");
+    const { startBrokerIpc, brokerSockPath } = await import("../broker/ipc");
+    const { brokerReply, sendMessageToUser } = await import("./discord");
+
+    const inboxDb = openInbox(inboxDbFile());
+    const sockPath = brokerSockPath();
+    const supervisor = createSessionSupervisor({
+      sockPath,
+      onAlert: (sessionKey, msg) => {
+        console.error(`[${ts()}] [broker] ALERT ${sessionKey}: ${msg}`);
+        // Best-effort operator DM so a breaker-open lane is visible off-box.
+        const token = currentSettings.discord.token;
+        const operator = currentSettings.discord.allowedUserIds[0];
+        if (token && operator) {
+          void sendMessageToUser(token, operator, `⚠️ Hermes broker lane ${sessionKey}: ${msg}`).catch(
+            () => {},
+          );
+        }
+      },
+    });
+
+    const ipc = await startBrokerIpc({
+      inboxDb,
+      onReply: ({ sessionKey, chatId, text, replyTo }) =>
+        brokerReply(sessionKey, chatId, text, replyTo),
+      ensureSession: (sessionKey, cwd) => supervisor.ensureSession(sessionKey, cwd),
+      recycleSession: (sessionKey, reason) => supervisor.recycleSession(sessionKey, reason),
+      verifyToken: (sessionKey, token) => supervisor.verifyToken(sessionKey, token),
+      markPong: (sessionKey) => supervisor.markPong(sessionKey),
+      laneState: (sessionKey) => supervisor.get(sessionKey)?.state,
+    });
+
+    brokerIpc = ipc;
+    setBrokerIpc(ipc);
+    brokerShutdown = async () => {
+      setBrokerIpc(null);
+      await ipc.close().catch(() => {});
+      await supervisor.shutdown().catch(() => {});
+      closeInbox(inboxDb);
+      brokerIpc = null;
+      brokerShutdown = null;
+    };
+    console.log(`[${ts()}] Broker: enabled (sessions, sock ${sockPath})`);
+  }
+
+  if (currentSettings.discord.useBrokerSessions) {
+    await startBroker().catch((err) => {
+      console.error(`[${ts()}] Broker bring-up failed (metered path stays active): ${String(err)}`);
+    });
+  } else {
+    console.log("  Broker: disabled (metered claude -p path)");
+  }
 
   // --- Helpers ---
   function ts() {
@@ -840,6 +909,16 @@ export async function start(args: string[] = []) {
 
       await initTelegram(newSettings.telegram.token);
       await initDiscord(newSettings.discord.token);
+
+      // Broker can be enabled (but not disabled) at runtime: flipping it on
+      // brings the lanes up; flipping it off is a restart-class change so a
+      // live broker keeps serving until shutdown (avoids tearing down lanes
+      // mid-task). currentSettings is already updated above.
+      if (newSettings.discord.useBrokerSessions && !brokerIpc) {
+        await startBroker().catch((err) => {
+          console.error(`[${ts()}] Broker bring-up (hot-reload) failed: ${String(err)}`);
+        });
+      }
     } catch (err) {
       console.error(`[${ts()}] Hot-reload error:`, err);
     }

@@ -1,6 +1,7 @@
 import { mkdir, readFile, writeFile } from "fs/promises";
 import { join } from "path";
 import { existsSync } from "fs";
+import { randomUUID } from "node:crypto";
 import { getSession, createSession, incrementTurn, markCompactWarned } from "./sessions";
 import {
   createThreadSession,
@@ -39,6 +40,7 @@ import {
   extractSessionAndResult as extractSessionAndResultFromParsed,
   extractSessionAndResultFromText,
 } from "./runtime/claude-output";
+import type { BrokerIpc } from "./broker/ipc";
 
 // These are anchored to the hermes installation (via import.meta.dir), not the
 // project's cwd, so they are safe to freeze at module load.
@@ -77,6 +79,23 @@ export interface RunResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+}
+
+/**
+ * Phase-1 broker singleton. `start.ts` injects the live BrokerIpc handle after
+ * bring-up (openInbox -> createSessionSupervisor -> startBrokerIpc) so the
+ * runner can reach the broker WITHOUT importing src/broker/* at module scope —
+ * breaking the runner<->broker import cycle. Null until injected (and on the
+ * metered-only path), which keeps execClaude on the existing `claude -p` branch.
+ */
+let brokerIpc: BrokerIpc | null = null;
+
+export function setBrokerIpc(ipc: BrokerIpc | null): void {
+  brokerIpc = ipc;
+}
+
+export function getBrokerIpc(): BrokerIpc | null {
+  return brokerIpc;
 }
 
 const RATE_LIMIT_PATTERN = /you.ve hit your limit|out of extra usage/i;
@@ -735,6 +754,52 @@ async function execClaude(
   source: ThreadSource = "cli",
   cwd: string = process.cwd(),
 ): Promise<RunResult> {
+  // ---- BROKER LANE (subscription-billed). Default-off; metered path below is
+  // the instant-rollback else-branch. Gated on the flag + Discord source + an
+  // injected BrokerIpc handle (null on the metered-only daemon). ----
+  const brokerSettings = getSettings();
+  const ipc = getBrokerIpc();
+  if (brokerSettings.discord?.useBrokerSessions && source === "discord" && ipc) {
+    const sessionKey = threadId ? threadKey(source, threadId) : workspaceKey(cwd);
+    // threadId carries the Discord channelId at the discord.ts:599 call site
+    // (resolveChannelCwd keys on it). discordMsgId de-dups gateway-resume
+    // re-delivery. We append a random UUID so two distinct user messages in the
+    // SAME millisecond (or two channels sharing one cwd) never collide onto one
+    // UNIQUE key (which would silently drop the second message — the §4 loss
+    // failure). TODO Phase-1.1: thread the real Discord message.id through
+    // runUserMessage so re-delivery dedups on the true snowflake (and a gateway
+    // resume of the SAME message becomes the intended no-op).
+    const chatId = threadId ?? cwd;
+    const discordMsgId = `${sessionKey}:${Date.now()}:${randomUUID()}`;
+    const meta = {
+      chat_id: chatId,
+      message_id: discordMsgId,
+      user: name,
+      user_id: "",
+      ts: new Date().toISOString(),
+      thread_id: threadId,
+      cwd,
+    };
+    try {
+      // Persist BEFORE dispatch (UNIQUE de-dup), ensure the lane, push, then
+      // await DELIVERED ack. The lane releases on delivered+acked; replies flush
+      // async via shim->broker->sendMessage (broker owns egress). Skip the await
+      // on a dedup (inserted:false) — there's no fresh push, so no ack to wait
+      // for; the original turn is already in flight or answered.
+      const rec = await ipc.sendInbound(sessionKey, prompt, meta);
+      if (rec.inserted) {
+        await ipc.awaitDelivered(sessionKey, discordMsgId);
+      }
+    } catch (e) {
+      // Per-session isolation + log-and-keep-serving: never throw out of the lane.
+      console.error(`[${new Date().toLocaleTimeString()}] broker lane error for ${sessionKey}:`, e);
+    }
+    // Ack-only sentinel: broker owns egress, so discord.ts must NOT also send
+    // (companion guard at discord.ts:611 skips sendMessage on empty stdout).
+    return { stdout: "", stderr: "", exitCode: 0 };
+  }
+  // ---- existing metered path UNCHANGED below (Bun.spawn `claude -p --resume`) ----
+
   const logs = logsDir();
   await mkdir(logs, { recursive: true });
 
@@ -1096,7 +1161,21 @@ export async function run(
   source: ThreadSource = "cli",
   cwd: string = process.cwd(),
 ): Promise<RunResult> {
-  return enqueue(() => execClaude(name, prompt, threadId, sink, source, cwd), threadId, source);
+  // Serial-lane key must match the lane the work actually runs on. On the broker
+  // path, a Discord message with no threadId maps to workspaceKey(cwd) — a
+  // distinct lane per cwd — so it must NOT share the single global queue with
+  // every other cwd's channel (one cwd's slow/wedged turn would head-of-line-
+  // block another cwd, breaking per-session isolation). Derive a synthetic
+  // queue threadId from the broker sessionKey in that case. execClaude still
+  // receives the real (undefined) threadId so its own sessionKey math is intact.
+  let queueThreadId = threadId;
+  if (!threadId && source === "discord") {
+    const settings = getSettings();
+    if (settings.discord?.useBrokerSessions && getBrokerIpc()) {
+      queueThreadId = `broker:${workspaceKey(cwd)}`;
+    }
+  }
+  return enqueue(() => execClaude(name, prompt, threadId, sink, source, cwd), queueThreadId, source);
 }
 
 function prefixUserMessageWithClock(prompt: string): string {
