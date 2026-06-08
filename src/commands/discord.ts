@@ -657,7 +657,12 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
       transport: discordStatusTransport(config.token),
       channelId,
     });
-    const result = await runUserMessage("discord", prefixedPrompt, threadId, statusSink, "discord", resolveChannelCwd(channelId));
+    const result = await runUserMessage("discord", prefixedPrompt, threadId, statusSink, "discord", resolveChannelCwd(channelId), {
+      channelId,
+      messageId: message.id,
+      userId,
+      user: message.author.username,
+    });
 
     if (result.exitCode !== 0) {
       await sendMessage(config.token, channelId, `Error (exit ${result.exitCode}): ${result.stderr || result.stdout || "Unknown error"}`);

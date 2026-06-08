@@ -746,6 +746,15 @@ export async function compactCurrentSession(
     : { success: false, message };
 }
 
+/** Discord routing context for the broker lane: the real channel/thread to
+ * reply into (chat_id) and the real message snowflake (gateway-resume de-dup key). */
+export interface DiscordRunContext {
+  channelId: string;
+  messageId: string;
+  userId?: string;
+  user?: string;
+}
+
 async function execClaude(
   name: string,
   prompt: string,
@@ -753,6 +762,7 @@ async function execClaude(
   sink?: StatusSink,
   source: ThreadSource = "cli",
   cwd: string = process.cwd(),
+  discordCtx?: DiscordRunContext,
 ): Promise<RunResult> {
   // ---- BROKER LANE (subscription-billed). Default-off; metered path below is
   // the instant-rollback else-branch. Gated on the flag + Discord source + an
@@ -769,13 +779,18 @@ async function execClaude(
     // failure). TODO Phase-1.1: thread the real Discord message.id through
     // runUserMessage so re-delivery dedups on the true snowflake (and a gateway
     // resume of the SAME message becomes the intended no-op).
-    const chatId = threadId ?? cwd;
-    const discordMsgId = `${sessionKey}:${Date.now()}:${randomUUID()}`;
+    // Prefer the REAL Discord ids threaded from handleMessageCreate: channelId is
+    // where the reply must go (chat_id), messageId is the snowflake we de-dup
+    // gateway-resume re-delivery on (a resume of the SAME message is now the
+    // intended no-op). Fall back to the synthetic form only when no discordCtx
+    // was passed, so non-message callers keep working.
+    const chatId = discordCtx?.channelId ?? threadId ?? cwd;
+    const discordMsgId = discordCtx?.messageId ?? `${sessionKey}:${Date.now()}:${randomUUID()}`;
     const meta = {
       chat_id: chatId,
       message_id: discordMsgId,
-      user: name,
-      user_id: "",
+      user: discordCtx?.user ?? name,
+      user_id: discordCtx?.userId ?? "",
       ts: new Date().toISOString(),
       thread_id: threadId,
       cwd,
@@ -1160,6 +1175,7 @@ export async function run(
   sink?: StatusSink,
   source: ThreadSource = "cli",
   cwd: string = process.cwd(),
+  discordCtx?: DiscordRunContext,
 ): Promise<RunResult> {
   // Serial-lane key must match the lane the work actually runs on. On the broker
   // path, a Discord message with no threadId maps to workspaceKey(cwd) — a
@@ -1175,7 +1191,7 @@ export async function run(
       queueThreadId = `broker:${workspaceKey(cwd)}`;
     }
   }
-  return enqueue(() => execClaude(name, prompt, threadId, sink, source, cwd), queueThreadId, source);
+  return enqueue(() => execClaude(name, prompt, threadId, sink, source, cwd, discordCtx), queueThreadId, source);
 }
 
 function prefixUserMessageWithClock(prompt: string): string {
@@ -1196,8 +1212,9 @@ export async function runUserMessage(
   sink?: StatusSink,
   source: ThreadSource = "cli",
   cwd: string = process.cwd(),
+  discordCtx?: DiscordRunContext,
 ): Promise<RunResult> {
-  return run(name, prefixUserMessageWithClock(prompt), threadId, sink, source, cwd);
+  return run(name, prefixUserMessageWithClock(prompt), threadId, sink, source, cwd, discordCtx);
 }
 
 /**
