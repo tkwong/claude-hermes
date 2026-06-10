@@ -63,19 +63,71 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: "reply",
       description:
         "Send a message back to the originating Discord chat. Pass back the chat_id you " +
-        "received in the <channel> frame. You may call it multiple times (progress + final).",
+        "received in the <channel> frame. You may call it multiple times (progress + final). " +
+        "To REACT to a message with an emoji, include `[react:👍]` anywhere in `text` AND set " +
+        "`reply_to` to that message's id (the message_id attribute in the <channel> frame) — the " +
+        "reaction lands on that message; remaining text is sent as a normal message (omit text " +
+        "to react only). To QUOTE-REPLY a specific message, set `reply_to` to its message_id. " +
+        "To send file(s)/image(s) back, pass absolute paths in `files`.",
       inputSchema: {
         type: "object",
         required: ["chat_id", "text"],
         properties: {
           chat_id: { type: "string", description: "Discord channel/thread id from meta.chat_id" },
           text: { type: "string" },
-          reply_to: { type: "string", description: "message_id to thread-reply to (optional)" },
+          reply_to: {
+            type: "string",
+            description:
+              "message_id to quote-reply to / react on (use the message_id from the <channel> frame)",
+          },
           files: {
             type: "array",
             items: { type: "string" },
-            description: "absolute paths (optional)",
+            description: "absolute file paths to upload as attachments (optional)",
           },
+        },
+      },
+    },
+    {
+      name: "create_thread",
+      description:
+        "Open a NEW Discord thread under the current channel and get its id back. Use this " +
+        "to spin up a separate session for a sub-task: the new thread becomes its own " +
+        "Claude session (threads => session), so the user can continue that sub-task there " +
+        "in isolation. Pass the parent channel's chat_id from the <channel> frame (must be a " +
+        "top-level channel — Discord has no threads-in-threads). After it returns thread_id, " +
+        "call `reply` with chat_id=<thread_id> to post into the new thread.",
+      inputSchema: {
+        type: "object",
+        required: ["chat_id", "name"],
+        properties: {
+          chat_id: {
+            type: "string",
+            description: "Parent channel id from meta.chat_id (a channel, not a thread)",
+          },
+          name: { type: "string", description: "Thread name (<= 100 chars)" },
+          seed_text: {
+            type: "string",
+            description: "Optional first message to post into the new thread",
+          },
+        },
+      },
+    },
+    {
+      name: "progress",
+      description:
+        "Show a LIVE status line for a slow turn so the user knows what you're doing " +
+        "(there is otherwise only a 'typing…' dot). The first call posts a status message; " +
+        "each later call EDITS it in place (no spam). Call it at the START of any turn that " +
+        "will take more than a few seconds — e.g. progress('🔍 睇緊 memory…') — and update it " +
+        "as you move to a new step. The status message is auto-removed when you send your final " +
+        "`reply`. This is for short status notes, NOT your actual answer (use `reply` for that).",
+      inputSchema: {
+        type: "object",
+        required: ["chat_id", "text"],
+        properties: {
+          chat_id: { type: "string", description: "Discord channel/thread id from meta.chat_id" },
+          text: { type: "string", description: "Short status line (e.g. '⚙️ 揾緊 X…')" },
         },
       },
     },
@@ -83,6 +135,39 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  if (req.params.name === "progress") {
+    const a = req.params.arguments as { chat_id: string; text: string };
+    if (!BROKER_MODE) {
+      return { content: [{ type: "text", text: "progress noted (poc)" }] };
+    }
+    const ack = await rpcProgress({ chat_id: a.chat_id, text: a.text });
+    if (!ack.ok) {
+      return { isError: true, content: [{ type: "text", text: ack.error ?? "progress failed" }] };
+    }
+    return { content: [{ type: "text", text: "status updated" }] };
+  }
+  if (req.params.name === "create_thread") {
+    const a = req.params.arguments as { chat_id: string; name: string; seed_text?: string };
+    if (!BROKER_MODE) {
+      return { isError: true, content: [{ type: "text", text: "create_thread requires broker mode" }] };
+    }
+    const ack = await rpcCreateThread({
+      parent_chat_id: a.chat_id,
+      name: a.name,
+      seed_text: a.seed_text,
+    });
+    if (!ack.ok || !ack.threadId) {
+      return { isError: true, content: [{ type: "text", text: ack.error ?? "create_thread failed" }] };
+    }
+    return {
+      content: [
+        {
+          type: "text",
+          text: `thread created: ${ack.threadId} — reply with chat_id=${ack.threadId} to post in it`,
+        },
+      ],
+    };
+  }
   if (req.params.name !== "reply") throw new Error(`unknown tool ${req.params.name}`);
   const a = req.params.arguments as {
     chat_id: string;
@@ -133,11 +218,54 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   return { content: [{ type: "text", text: "sent (poc)" }] };
 });
 
-function emitInbound(content: string, meta: Record<string, unknown>): void {
+// Boot-race guard. Claude silently DROPS channel notifications that arrive before
+// it has finished loading the channel ("if the session hasn't loaded your server
+// as a channel, events are dropped silently" — channels-reference). A broker that
+// replays a PENDING inbound the instant the shim sends hello races claude's boot
+// (it is still spawning its other MCP servers), so that first message vanishes.
+// The official chat channels never hit this: their messages only arrive after the
+// session is already warm. We bridge the gap here — buffer emissions until Claude
+// completes the MCP `initialize` handshake (server.oninitialized) plus a short
+// grace for its turn loop to be ready, then flush in order. A fallback timer flips
+// us ready even if oninitialized never fires, so an inbound can never strand.
+const CHANNEL_READY_GRACE_MS = Number(process.env.HERMES_CHANNEL_READY_GRACE_MS ?? "4000");
+const CHANNEL_READY_FALLBACK_MS = Number(process.env.HERMES_CHANNEL_READY_FALLBACK_MS ?? "20000");
+let channelReady = false;
+const pendingEmissions: Array<{ content: string; meta: Record<string, unknown> }> = [];
+
+function doEmit(content: string, meta: Record<string, unknown>): void {
   // Inbound -> the ONE parent Claude session. Fire-and-forget per channels-reference.
   server
     .notification({ method: "notifications/claude/channel", params: { content, meta } })
     .catch((e) => process.stderr.write(`inbound emit failed: ${e}\n`));
+}
+
+function markChannelReady(why: string): void {
+  if (channelReady) return;
+  channelReady = true;
+  if (pendingEmissions.length > 0) {
+    process.stderr.write(
+      `[shim ${SESSION_KEY}] channel ready (${why}); flushing ${pendingEmissions.length} buffered inbound(s)\n`,
+    );
+  }
+  const drained = pendingEmissions.splice(0, pendingEmissions.length);
+  for (const e of drained) doEmit(e.content, e.meta);
+}
+
+// Claude finished the MCP initialize handshake → it has registered the channel
+// listener. Give its turn loop a short grace, then start delivering.
+server.oninitialized = () => {
+  setTimeout(() => markChannelReady("initialized+grace"), CHANNEL_READY_GRACE_MS);
+};
+// Defensive: never strand a buffered inbound if oninitialized never fires.
+setTimeout(() => markChannelReady("fallback"), CHANNEL_READY_FALLBACK_MS).unref?.();
+
+function emitInbound(content: string, meta: Record<string, unknown>): void {
+  if (!channelReady) {
+    pendingEmissions.push({ content, meta });
+    return;
+  }
+  doEmit(content, meta);
 }
 
 // ---- broker IPC (length-prefixed JSON over AF_UNIX) ----
@@ -202,6 +330,20 @@ interface ReplyAck {
   error?: string;
 }
 
+interface CreateThreadAck {
+  ok: boolean;
+  threadId?: string;
+  parentId?: string;
+  error?: string;
+}
+const pendingCreateThread = new Map<string, (ack: CreateThreadAck) => void>();
+
+interface ProgressAck {
+  ok: boolean;
+  error?: string;
+}
+const pendingProgress = new Map<string, (ack: ProgressAck) => void>();
+
 /**
  * Return AND clear the tracked inbound seq for a chat. The first reply after an
  * inbound consumes it (becomes the final, answered reply); later replies with no
@@ -249,6 +391,43 @@ function rpcReply(args: {
   });
 }
 
+function rpcCreateThread(args: {
+  parent_chat_id: string;
+  name: string;
+  seed_text?: string;
+}): Promise<CreateThreadAck> {
+  const rpcId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return new Promise<CreateThreadAck>((resolve) => {
+    pendingCreateThread.set(rpcId, resolve);
+    if (!sock || sock.destroyed) {
+      pendingCreateThread.delete(rpcId);
+      resolve({ ok: false, error: "broker socket not connected" });
+      return;
+    }
+    writeFrame({
+      type: "create_thread",
+      sessionKey: SESSION_KEY,
+      rpcId,
+      parent_chat_id: args.parent_chat_id,
+      name: args.name,
+      seed_text: args.seed_text,
+    });
+  });
+}
+
+function rpcProgress(args: { chat_id: string; text: string }): Promise<ProgressAck> {
+  const rpcId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return new Promise<ProgressAck>((resolve) => {
+    pendingProgress.set(rpcId, resolve);
+    if (!sock || sock.destroyed) {
+      pendingProgress.delete(rpcId);
+      resolve({ ok: false, error: "broker socket not connected" });
+      return;
+    }
+    writeFrame({ type: "progress", sessionKey: SESSION_KEY, rpcId, chat_id: args.chat_id, text: args.text });
+  });
+}
+
 function handleFrame(msg: Record<string, unknown>): void {
   switch (msg.type) {
     case "hello_ack": {
@@ -293,6 +472,32 @@ function handleFrame(msg: Record<string, unknown>): void {
       }
       break;
     }
+    case "create_thread_ack": {
+      const rpcId = typeof msg.rpcId === "string" ? msg.rpcId : "";
+      const resolve = pendingCreateThread.get(rpcId);
+      if (resolve) {
+        pendingCreateThread.delete(rpcId);
+        resolve({
+          ok: msg.ok === true,
+          threadId: typeof msg.threadId === "string" ? msg.threadId : undefined,
+          parentId: typeof msg.parentId === "string" ? msg.parentId : undefined,
+          error: typeof msg.error === "string" ? msg.error : undefined,
+        });
+      }
+      break;
+    }
+    case "progress_ack": {
+      const rpcId = typeof msg.rpcId === "string" ? msg.rpcId : "";
+      const resolve = pendingProgress.get(rpcId);
+      if (resolve) {
+        pendingProgress.delete(rpcId);
+        resolve({
+          ok: msg.ok === true,
+          error: typeof msg.error === "string" ? msg.error : undefined,
+        });
+      }
+      break;
+    }
     case "ping": {
       const ts = typeof msg.ts === "number" ? msg.ts : Date.now();
       writeFrame({ type: "pong", sessionKey: SESSION_KEY, ts });
@@ -324,6 +529,14 @@ function failAllPending(reason: string): void {
   for (const [rpcId, resolve] of pending) {
     pending.delete(rpcId);
     resolve({ ok: false, id: "", error: reason });
+  }
+  for (const [rpcId, resolve] of pendingCreateThread) {
+    pendingCreateThread.delete(rpcId);
+    resolve({ ok: false, error: reason });
+  }
+  for (const [rpcId, resolve] of pendingProgress) {
+    pendingProgress.delete(rpcId);
+    resolve({ ok: false, error: reason });
   }
 }
 

@@ -651,7 +651,43 @@ export async function start(args: string[] = []) {
     const { openInbox, inboxDbFile, closeInbox } = await import("../broker/inbox");
     const { createSessionSupervisor, installChannelShim } = await import("../broker/sessions");
     const { startBrokerIpc, brokerSockPath } = await import("../broker/ipc");
-    const { brokerReply, sendMessageToUser } = await import("./discord");
+    const {
+      brokerReply,
+      brokerCreateThread,
+      brokerSendTyping,
+      brokerProgress,
+      clearBrokerStatus,
+      clearAllBrokerStatus,
+      sendMessageToUser,
+    } = await import("./discord");
+
+    // "typing…" indicator per chat while a lane works a (possibly multi-minute,
+    // high-effort) turn. Started on inbound delivery, refreshed every 8s (Discord
+    // typing auto-expires ~10s), stopped on the turn-final reply or a safety
+    // deadline so a turn that never finals can't pin the indicator forever.
+    const typingTimers = new Map<string, ReturnType<typeof setInterval>>();
+    const typingDeadline = new Map<string, number>();
+    const TYPING_MAX_MS = 5 * 60_000;
+    function startTyping(chatId: string): void {
+      typingDeadline.set(chatId, Date.now() + TYPING_MAX_MS);
+      void brokerSendTyping(chatId);
+      if (typingTimers.has(chatId)) return;
+      const t = setInterval(() => {
+        if (Date.now() > (typingDeadline.get(chatId) ?? 0)) {
+          stopTyping(chatId);
+          return;
+        }
+        void brokerSendTyping(chatId);
+      }, 8000);
+      t.unref?.();
+      typingTimers.set(chatId, t);
+    }
+    function stopTyping(chatId: string): void {
+      const t = typingTimers.get(chatId);
+      if (t) clearInterval(t);
+      typingTimers.delete(chatId);
+      typingDeadline.delete(chatId);
+    }
 
     // Masquerade-install our channel shim into the allowlisted discord plugin so
     // lanes can launch via `--channels plugin:discord@claude-plugins-official`
@@ -666,6 +702,9 @@ export async function start(args: string[] = []) {
     const sockPath = brokerSockPath();
     const supervisor = createSessionSupervisor({
       sockPath,
+      // Reap a lane after N min idle (config: discord.idleReapMinutes, default 60,
+      // 0 disables). A reaped lane cold-starts on the next message.
+      idleReapMs: (currentSettings.discord.idleReapMinutes ?? 60) * 60_000,
       onAlert: (sessionKey, msg) => {
         console.error(`[${ts()}] [broker] ALERT ${sessionKey}: ${msg}`);
         // Best-effort operator DM so a breaker-open lane is visible off-box.
@@ -681,8 +720,21 @@ export async function start(args: string[] = []) {
 
     const ipc = await startBrokerIpc({
       inboxDb,
-      onReply: ({ sessionKey, chatId, text, replyTo }) =>
-        brokerReply(sessionKey, chatId, text, replyTo),
+      onReply: async ({ sessionKey, chatId, text, replyTo, files, final }) => {
+        // Turn done → remove the live status message BEFORE posting the answer, so
+        // the user sees the answer land (not a stale "🔍 …" lingering above it).
+        if (final) clearBrokerStatus(chatId);
+        try {
+          await brokerReply(sessionKey, chatId, text, replyTo, files);
+        } finally {
+          // Turn done → drop the typing indicator (progress replies keep it on).
+          if (final) stopTyping(chatId);
+        }
+      },
+      onInbound: ({ chatId }) => startTyping(chatId),
+      onProgress: ({ sessionKey, chatId, text }) => brokerProgress(sessionKey, chatId, text),
+      onCreateThread: ({ sessionKey, parentChatId, name, seedText }) =>
+        brokerCreateThread(sessionKey, parentChatId, name, seedText),
       ensureSession: (sessionKey, cwd) => supervisor.ensureSession(sessionKey, cwd),
       recycleSession: (sessionKey, reason) => supervisor.recycleSession(sessionKey, reason),
       verifyToken: (sessionKey, token) => supervisor.verifyToken(sessionKey, token),
@@ -694,6 +746,12 @@ export async function start(args: string[] = []) {
     setBrokerIpc(ipc);
     brokerShutdown = async () => {
       setBrokerIpc(null);
+      for (const t of typingTimers.values()) clearInterval(t);
+      typingTimers.clear();
+      typingDeadline.clear();
+      // Delete any live "⏳ …" status messages so a restart that kills in-flight
+      // lanes doesn't leave them stranded (the killed lane can't clear its own).
+      await clearAllBrokerStatus().catch(() => {});
       await ipc.close().catch(() => {});
       await supervisor.shutdown().catch(() => {});
       closeInbox(inboxDb);

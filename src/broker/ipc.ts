@@ -140,7 +140,35 @@ export interface BrokerIpcOptions {
     text: string;
     replyTo?: string;
     files?: string[];
+    /** True on the turn-final reply (the one that answers the inbox row). Lets the
+     *  daemon stop the "typing…" indicator only when the turn is actually done. */
+    final?: boolean;
   }) => Promise<void>;
+  /**
+   * Fired when an inbound is delivered to a live lane (the lane is now WORKING on
+   * it). The daemon uses this to start a platform "typing…"/activity indicator so
+   * a slow (high-effort) turn doesn't look dead. Stop signal = the matching final
+   * `onReply`. Optional + best-effort (never blocks delivery).
+   */
+  onInbound?: (r: { sessionKey: string; chatId: string }) => void;
+  /**
+   * Live progress/status update for the shim's `progress` tool — the daemon posts
+   * or edits a single status message for the chat (cleared by the final reply).
+   * Optional; when absent the shim's tool acks an error.
+   */
+  onProgress?: (r: { sessionKey: string; chatId: string; text: string }) => Promise<void>;
+  /**
+   * Creates a real platform thread under a parent chat for the shim's
+   * `create_thread` tool, returning the new thread id (Claude then replies into
+   * it). Optional — when absent the shim's tool acks an error. The implementation
+   * enforces the allowlist + per-session ownership (broker never re-checks).
+   */
+  onCreateThread?: (r: {
+    sessionKey: string;
+    parentChatId: string;
+    name: string;
+    seedText?: string;
+  }) => Promise<{ threadId: string; parentId: string }>;
   /** Lazily spawns the tmux+claude+shim lane for a sessionKey (supervisor). */
   ensureSession: (sessionKey: string, cwd: string) => Promise<void>;
   /** Kills + respawns ONE lane (per-session isolation; never touches others). */
@@ -313,6 +341,12 @@ export async function startBrokerIpc(opts: BrokerIpcOptions): Promise<BrokerIpc>
       content: row.content,
       meta: parseMeta(row),
     });
+    // The lane is now working on this inbound — kick the "typing…" indicator.
+    try {
+      opts.onInbound?.({ sessionKey, chatId: row.chatId });
+    } catch (e) {
+      logErr(`onInbound(${sessionKey}) failed: ${String(e)}`);
+    }
   }
 
   function parseMeta(row: InboxRow): InboxMeta {
@@ -472,19 +506,13 @@ export async function startBrokerIpc(opts: BrokerIpcOptions): Promise<BrokerIpc>
       });
       return;
     }
-    // Phase 1: files accepted in the schema but logged + ignored (Phase 2 runs
-    // assertSendable before attaching).
-    if (files && files.length > 0) {
-      logErr(`reply for ${sessionKey} included ${files.length} file(s); ignored in Phase 1`);
-    }
-
     // Serialize egress per sessionKey: chain onto the lane's reply promise so
     // two reply frames read back-to-back reach Discord in order (a 429 retry on
     // the first can't let the second overtake it). Distinct lanes are parallel.
     const prev = replyChains.get(sessionKey) ?? Promise.resolve();
     const run = prev.then(async () => {
       try {
-        await opts.onReply({ sessionKey, chatId, text, replyTo, files });
+        await opts.onReply({ sessionKey, chatId, text, replyTo, files, final: isFinal });
         // Mark answered ONLY on the final reply (idempotent on an already-
         // answered row). Progress replies leave the row open + replayable.
         if (isFinal && seq !== null) {
@@ -506,6 +534,111 @@ export async function startBrokerIpc(opts: BrokerIpcOptions): Promise<BrokerIpc>
     });
     // Keep the chain alive but swallow rejections so one failed egress doesn't
     // poison the lane's future replies (log-and-keep-serving).
+    replyChains.set(
+      sessionKey,
+      run.catch(() => undefined),
+    );
+    await run.catch(() => undefined);
+  }
+
+  // ---- create_thread: route to platform thread-create egress, ack with id ----
+  // Same auth gate as handleReply (hello-bound socket only) and same per-session
+  // egress serialization, so a create_thread + the reply that follows it reach
+  // the platform in order.
+  async function handleCreateThread(c: Conn, msg: Record<string, unknown>): Promise<void> {
+    if (c.sessionKey === null) {
+      logErr(`create_thread from unauthenticated socket (no hello); dropping`);
+      return;
+    }
+    const sessionKey = c.sessionKey;
+    const rpcId = asString(msg.rpcId);
+    const parentChatId = asString(msg.parent_chat_id);
+    const name = asString(msg.name) ?? "";
+    const seedText = asString(msg.seed_text) ?? undefined;
+    if (rpcId === null) {
+      logErr(`create_thread from ${sessionKey} missing rpcId; dropping`);
+      return;
+    }
+    if (!opts.onCreateThread) {
+      safeWrite(c, { type: "create_thread_ack", sessionKey, rpcId, ok: false, error: "create_thread not supported" });
+      return;
+    }
+    if (parentChatId === null || !name.trim()) {
+      safeWrite(c, {
+        type: "create_thread_ack",
+        sessionKey,
+        rpcId,
+        ok: false,
+        error: "parent_chat_id and name required",
+      });
+      return;
+    }
+    const prev = replyChains.get(sessionKey) ?? Promise.resolve();
+    const run = prev.then(async () => {
+      try {
+        const { threadId, parentId } = await opts.onCreateThread!({
+          sessionKey,
+          parentChatId,
+          name,
+          seedText,
+        });
+        safeWrite(c, { type: "create_thread_ack", sessionKey, rpcId, ok: true, threadId, parentId });
+      } catch (e) {
+        const error =
+          e instanceof Error && /allowlist|owned|not configured/i.test(e.message)
+            ? e.message
+            : `create_thread failed: ${String(e)}`;
+        logErr(`onCreateThread for ${sessionKey} failed: ${String(e)}`);
+        safeWrite(c, { type: "create_thread_ack", sessionKey, rpcId, ok: false, error });
+      }
+    });
+    replyChains.set(
+      sessionKey,
+      run.catch(() => undefined),
+    );
+    await run.catch(() => undefined);
+  }
+
+  // ---- progress: live status egress (post/edit a status message), ack ----
+  // Same auth gate + per-session serialization as handleReply, so a progress
+  // update and the reply that follows reach the platform in order.
+  async function handleProgress(c: Conn, msg: Record<string, unknown>): Promise<void> {
+    if (c.sessionKey === null) {
+      logErr(`progress from unauthenticated socket (no hello); dropping`);
+      return;
+    }
+    const sessionKey = c.sessionKey;
+    const rpcId = asString(msg.rpcId);
+    const chatId = asString(msg.chat_id);
+    const text = asString(msg.text) ?? "";
+    if (rpcId === null) {
+      logErr(`progress from ${sessionKey} missing rpcId; dropping`);
+      return;
+    }
+    if (!opts.onProgress) {
+      safeWrite(c, { type: "progress_ack", sessionKey, rpcId, ok: false, error: "progress not supported" });
+      return;
+    }
+    if (chatId === null) {
+      safeWrite(c, { type: "progress_ack", sessionKey, rpcId, ok: false, error: "chat_id missing" });
+      return;
+    }
+    const prev = replyChains.get(sessionKey) ?? Promise.resolve();
+    const run = prev.then(async () => {
+      try {
+        await opts.onProgress!({ sessionKey, chatId, text });
+        safeWrite(c, { type: "progress_ack", sessionKey, rpcId, ok: true });
+      } catch (e) {
+        logErr(`onProgress for ${sessionKey} failed: ${String(e)}`);
+        safeWrite(c, {
+          type: "progress_ack",
+          sessionKey,
+          rpcId,
+          ok: false,
+          error: `progress failed: ${String(e)}`,
+        });
+      }
+    });
     replyChains.set(
       sessionKey,
       run.catch(() => undefined),
@@ -556,6 +689,12 @@ export async function startBrokerIpc(opts: BrokerIpcOptions): Promise<BrokerIpc>
               // fire-and-forget: a slow egress never blocks the read loop, and a
               // rejected promise is swallowed inside handleReply (acks ok:false).
               void handleReply(conn, msg);
+              break;
+            case "create_thread":
+              void handleCreateThread(conn, msg);
+              break;
+            case "progress":
+              void handleProgress(conn, msg);
               break;
             case "pong":
               handlePong(conn, msg);

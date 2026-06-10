@@ -47,6 +47,14 @@ export interface SessionEntry {
   lastPongAt: number;
   failures: number;
   nextBackoffMs: number;
+  /**
+   * Last USER activity (an inbound for this lane via ensureSession). NOT bumped by
+   * heartbeat pongs — those prove the lane is alive, not that it's still wanted.
+   * The idle-reap sweep kills a lane whose lastActivityAt is older than idleReapMs
+   * so abandoned conversations don't leak a claude process forever. A reaped lane
+   * cold-starts again on the next inbound (ensureSession), so this is invisible.
+   */
+  lastActivityAt: number;
 }
 
 /**
@@ -82,6 +90,14 @@ export interface SessionSupervisorOptions {
    * CONNECTED shims). Default = 4x backoffBaseMs floored at 15s. 0 disables.
    */
   sweepIntervalMs?: number;
+  /**
+   * Reap (kill tmux + drop the registry entry) a lane with no USER activity (no
+   * inbound) for this long. Reclaims abandoned-conversation lanes so a long-lived
+   * daemon doesn't accumulate idle claude processes. A reaped lane cold-starts on
+   * the next inbound, so reaping is invisible to the user. Checked on the sweep
+   * cadence. Default 1 hour; 0 disables. NOT bumped by heartbeat pongs.
+   */
+  idleReapMs?: number;
   onAlert?: (sessionKey: string, msg: string) => void;
   /** Absolute path to the tmux binary. Defaults to /opt/homebrew/bin/tmux. */
   tmuxBin?: string;
@@ -135,6 +151,7 @@ const DEFAULT_STABLE_RESET_MS = 60_000;
 const DEFAULT_BREAKER_THRESHOLD = 5;
 const DEFAULT_CONNECT_TIMEOUT_MS = 30_000;
 const DEFAULT_SWEEP_INTERVAL_MS = 30_000;
+const DEFAULT_IDLE_REAP_MS = 60 * 60_000; // 1 hour of no user activity → reap
 const DEFAULT_TMUX_BIN = "/opt/homebrew/bin/tmux";
 
 /**
@@ -224,6 +241,8 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
   const breakerThreshold = opts.breakerThreshold ?? DEFAULT_BREAKER_THRESHOLD;
   const connectTimeoutMs = opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
   const sweepIntervalMs = opts.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS;
+  // Idle-reap: kill a lane with no user activity for this long (0 = disabled).
+  const idleReapMs = opts.idleReapMs ?? DEFAULT_IDLE_REAP_MS;
   const tmuxBin = opts.tmuxBin ?? DEFAULT_TMUX_BIN;
   const claudeBin = opts.claudeBin ?? "claude";
   const channelPlugin = opts.channelPlugin ?? "discord@claude-plugins-official";
@@ -345,17 +364,83 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
     // <tmuxName>`. We do NOT redirect/scrape its output. shimPath is consumed by
     // installChannelShim (the masquerade install), not the launch argv.
     void shimPath;
+    // `--channels plugin:X` only ACTIVATES the channel of an ALREADY-ENABLED
+    // plugin — it does NOT enable the plugin. If the masqueraded discord plugin
+    // isn't enabled in this lane's session scope, claude never spawns its MCP
+    // server (verified: debug log shows "Loaded plugins - Enabled: N" with no
+    // discord entry, yet the cosmetic "Channels (experimental) … inject directly"
+    // banner still prints). So we enable it PER-LANE via --settings (a JSON
+    // override that does NOT touch the user's or project settings.json), which is
+    // what makes claude actually spawn our masqueraded server.ts → broker hello.
+    const enableSettings = JSON.stringify({ enabledPlugins: { [channelPlugin]: true } });
+    // A lane is a HEADLESS interactive session — nobody is at the tmux keyboard.
+    // AskUserQuestion would render a selection menu and block the turn forever (no
+    // one can answer), so the lane wedges and the user's message never gets a
+    // reply. Two guards: (1) hard-remove the tool so it can't be called, and (2) a
+    // behavioural nudge telling Claude to ask via the channel `reply` tool (or take
+    // the safe default) instead of stopping at an interactive prompt.
+    const noTtyPrompt =
+      "You are running as a headless, no-TTY daemon session driven over a chat channel — " +
+      "there is NO human at this terminal. NEVER call the AskUserQuestion tool: it renders an " +
+      "interactive selector that will hang this session forever because nobody can answer it. " +
+      "When you need a decision, ASK the user via the `reply` tool (send your question to the " +
+      "chat and wait for their next message) or proceed with the safest / recommended default. " +
+      "Never block on an interactive prompt. " +
+      "FEEDBACK: the user only sees a 'typing…' dot while you work. If a turn will take more than " +
+      "a few seconds (reading files, running commands, investigating), call the `progress` tool " +
+      "FIRST with a short status line (e.g. progress('🔍 睇緊 memory…')) and update it as you move " +
+      "to each new step, so the user can see what you're doing. It edits one status message (no " +
+      "spam) and is auto-removed when you send your final `reply`.";
+    // Persistent context across reap/restart: each lane maps to a DETERMINISTIC
+    // claude session id (derived from its sessionKey). First spawn creates it with
+    // --session-id; a respawn (after idle-reap, crash, or daemon restart) finds the
+    // transcript on disk and --resume's it, so the conversation survives — a reaped
+    // lane cold-starts WITH its history instead of as a blank slate. (--session-id
+    // on an existing id errors "already in use", hence the file-existence switch.)
+    const sessionId = sessionUuidFor(entry.sessionKey);
+    const resumeArgs = claudeSessionExists(entry.cwd, sessionId)
+      ? ["--resume", sessionId]
+      : ["--session-id", sessionId];
     const claudeCmd = [
       claudeBin,
       "--channels",
       `plugin:${channelPlugin}`,
+      ...resumeArgs,
+      "--settings",
+      enableSettings,
+      "--disallowed-tools",
+      "AskUserQuestion",
+      "--append-system-prompt",
+      noTtyPrompt,
       "--dangerously-skip-permissions",
     ]
       .map(shellQuote)
       .join(" ");
 
+    // HERMES_* MUST be injected via tmux `-e` (per-session environment). Passing
+    // them only through the spawn env reaches the tmux CLIENT process, not the
+    // pane: when a tmux server is already running, it hands new panes the SERVER's
+    // environment (refreshed only for update-environment vars like DISPLAY/SSH_*),
+    // so arbitrary HERMES_* would be dropped — the shim then sees no SOCK, falls
+    // back to POC self-inject mode, and never reaches the broker (the connect
+    // timeout we observed). `-e` sets them on the session so the pane inherits
+    // them (verified live: env_has_SOCK=true inside the spawned plugin subprocess).
     const r = tmux(
-      ["new-session", "-d", "-s", entry.tmuxName, "-c", entry.cwd, claudeCmd],
+      [
+        "new-session",
+        "-d",
+        "-s",
+        entry.tmuxName,
+        "-c",
+        entry.cwd,
+        "-e",
+        `HERMES_BROKER_SOCK=${sockPath}`,
+        "-e",
+        `HERMES_SESSION_KEY=${entry.sessionKey}`,
+        "-e",
+        `HERMES_TOKEN=${entry.token}`,
+        claudeCmd,
+      ],
       entry.cwd,
       childEnv,
     );
@@ -380,6 +465,7 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
       lastPongAt: now(),
       failures: 0,
       nextBackoffMs: backoffBaseMs,
+      lastActivityAt: now(),
     };
   }
 
@@ -459,6 +545,8 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
     return enqueueLane(sessionKey, async () => {
       if (shuttingDown) return;
       let entry = registry.get(sessionKey);
+      // An inbound for this lane = user activity; push back the idle-reap clock.
+      if (entry) entry.lastActivityAt = now();
 
       // Cold start: no entry yet. Kill any pre-existing orphan tmux session for
       // this key first (e.g. survivor of a broker crash holding a stale token)
@@ -627,6 +715,18 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
   function sweepOnce(): void {
     if (shuttingDown) return;
     for (const entry of registry.values()) {
+      // Idle-reap first: a lane with no user activity for idleReapMs is killed
+      // outright (no respawn) and dropped from the registry; the next inbound
+      // cold-starts it via ensureSession. Takes priority over the liveness checks
+      // below (a long-idle lane shouldn't be recycled-then-reaped).
+      if (idleReapMs > 0 && now() - entry.lastActivityAt > idleReapMs) {
+        const idleMin = Math.round((now() - entry.lastActivityAt) / 60_000);
+        log(`sweep: reaping idle lane ${entry.sessionKey} (idle ${idleMin}m) — tmux killed, will cold-start on next message`);
+        if (tmuxHasSession(entry.tmuxName)) tmuxKillSession(entry.tmuxName);
+        registry.delete(entry.sessionKey);
+        void persist().catch(() => undefined);
+        continue;
+      }
       if (entry.state === "live" && !tmuxHasSession(entry.tmuxName)) {
         log(`sweep: lane ${entry.sessionKey} tmux gone while live; recycling`);
         void recycleSession(entry.sessionKey, "tmux session died (sweep)").catch(() => undefined);
@@ -722,4 +822,26 @@ function timingSafeEqualStr(a: string, b: string): boolean {
 function shellQuote(s: string): string {
   if (s.length > 0 && /^[A-Za-z0-9_/.:=@%+-]+$/.test(s)) return s;
   return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Deterministic v4-shaped UUID for a sessionKey. A lane always maps to the SAME
+ * claude session id across reaps/restarts, so the same on-disk transcript can be
+ * --resume'd and the conversation context persists.
+ */
+export function sessionUuidFor(sessionKey: string): string {
+  const h = createHash("sha256").update(`hermes-lane:${sessionKey}`).digest("hex");
+  const variant = ((Number.parseInt(h[16], 16) & 0x3) | 0x8).toString(16);
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-${variant}${h.slice(17, 20)}-${h.slice(20, 32)}`;
+}
+
+/**
+ * True if claude already has a transcript for this (cwd, session-id) — i.e. the
+ * lane ran before and must be --resume'd (claude errors if --session-id reuses an
+ * existing id). claude stores it at ~/.claude/projects/<cwd-with-nonalnum→->/<id>.jsonl.
+ */
+export function claudeSessionExists(cwd: string, uuid: string): boolean {
+  const home = process.env.HOME ?? homedir();
+  const enc = cwd.replace(/[^a-zA-Z0-9]/g, "-");
+  return existsSync(join(home, ".claude", "projects", enc, `${uuid}.jsonl`));
 }

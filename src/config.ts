@@ -96,6 +96,12 @@ export interface DiscordConfig {
    * existing metered path = instant rollback lever.
    */
   useBrokerSessions?: boolean;
+  /**
+   * Broker idle-reap: kill a lane's interactive claude session after this many
+   * minutes with no user activity (no inbound), reclaiming idle processes. A
+   * reaped lane cold-starts on the next message. Default 60; 0 disables.
+   */
+  idleReapMinutes?: number;
 }
 
 export type SecurityLevel =
@@ -357,6 +363,10 @@ function parseSettings(raw: Record<string, any>, discordUserIdsRaw: string[] = [
             )
           : {},
       useBrokerSessions: raw.discord?.useBrokerSessions === true,
+      idleReapMinutes:
+        typeof raw.discord?.idleReapMinutes === "number" && raw.discord.idleReapMinutes >= 0
+          ? raw.discord.idleReapMinutes
+          : undefined,
     },
     security: {
       level,
@@ -484,6 +494,17 @@ export async function reloadSettings(): Promise<Settings> {
 export function getSettings(): Settings {
   if (!cached) throw new Error("Settings not loaded. Call loadSettings() first.");
   return cached;
+}
+
+/**
+ * Test-only: drop the settings cache so the next loadSettings() re-reads disk.
+ * A test that chdirs into a fixture and calls reloadSettings() MUST call this
+ * (after restoring cwd) or every later getSettings() in the same bun process
+ * silently sees the fixture's settings.
+ */
+export function resetSettingsCacheForTest(): void {
+  cached = null;
+  cachedPath = null;
 }
 
 const PROMPT_FILE_PREFIX = "@file:";

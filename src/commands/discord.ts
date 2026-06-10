@@ -9,7 +9,7 @@ import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt } from "../skills";
 import { discoverSkills } from "../skills/discovery";
 import { mkdir } from "node:fs/promises";
-import { extname, join } from "node:path";
+import { basename, extname, join } from "node:path";
 import { discordInboxDir } from "../paths";
 import { projectSlugFromCwd } from "../runtime/claude-paths";
 import { extractSessionAndResultFromText } from "../runtime/claude-output";
@@ -61,6 +61,20 @@ interface DiscordAttachment {
   flags?: number;
 }
 
+interface DiscordPoll {
+  question?: { text?: string };
+  answers?: Array<{ answer_id?: number; poll_media?: { text?: string } }>;
+}
+
+interface DiscordMessageSnapshot {
+  message?: {
+    content?: string;
+    attachments?: DiscordAttachment[];
+    author?: DiscordUser;
+    poll?: DiscordPoll;
+  };
+}
+
 interface DiscordMessage {
   id: string;
   channel_id: string;
@@ -70,6 +84,12 @@ interface DiscordMessage {
   attachments: DiscordAttachment[];
   mentions: DiscordUser[];
   referenced_message?: DiscordMessage | null;
+  // Forwarded messages: message_reference.type === 1 (FORWARD) + a snapshot of
+  // the original (the visible `content` is empty for a pure forward).
+  message_reference?: { type?: number; message_id?: string; channel_id?: string };
+  message_snapshots?: DiscordMessageSnapshot[];
+  poll?: DiscordPoll;
+  sticker_items?: Array<{ id: string; name: string }>;
   flags?: number;
   type: number;
 }
@@ -126,6 +146,20 @@ let readyGuildIds: Set<string> | null = null;
 
 // Track known thread channel IDs and their parent channel IDs for multi-session support
 const knownThreads = new Map<string, { parentId: string }>();
+
+// DM channels VERIFIED this boot. A DM channel id never appears in
+// channelDirectories / listenChannels, so broker egress needs its own record of
+// which chat_ids are DMs we may reply to. Populated only by verifyDmChannel
+// (pre-warmed on authorized inbound DMs, backfilled on egress when a durable
+// inbox row outlives a daemon restart) — never by a blind insert, because a
+// MESSAGE_CREATE payload carries no channel type and a group DM (type 3, other
+// humans present) must not become an egress destination.
+const knownDMs = new Set<string>();
+
+// Broker live-progress: chatId -> the message id of the current turn's editable
+// "status" message (e.g. "🔍 睇緊 memory…"). brokerProgress posts it once then
+// edits it in place; the turn-final reply deletes it via clearBrokerStatus.
+const brokerStatusMsg = new Map<string, string>();
 
 /**
  * Resolve the project working directory (cwd) for a Discord channel.
@@ -186,6 +220,7 @@ async function sendMessage(
   channelId: string,
   text: string,
   components?: unknown[],
+  replyToMessageId?: string,
 ): Promise<void> {
   const normalized = text.replace(/\[react:[^\]\r\n]+\]/gi, "").trim();
   if (!normalized) return;
@@ -197,8 +232,69 @@ async function sendMessage(
     if (components && i + MAX_LEN >= normalized.length) {
       body.components = components;
     }
+    // A native reply reference belongs only on the FIRST chunk. fail_if_not_exists
+    // false → if the referenced message was deleted, send a normal message rather
+    // than erroring.
+    if (replyToMessageId && i === 0) {
+      body.message_reference = { message_id: replyToMessageId, fail_if_not_exists: false };
+    }
     await discordApi(token, "POST", `/channels/${channelId}/messages`, body);
   }
+}
+
+/**
+ * Outbound file attachments (multipart/form-data — discordApi is JSON-only). Used
+ * by brokerReply when Claude's `reply` carries `files`. Skips any path that is
+ * missing or over Discord's 25 MiB non-Nitro cap, returning the skipped names so
+ * the caller can tell the user instead of silently dropping them.
+ */
+async function sendFilesToChannel(
+  token: string,
+  channelId: string,
+  text: string,
+  filePaths: string[],
+  replyToMessageId?: string,
+): Promise<{ skipped: string[] }> {
+  const form = new FormData();
+  const skipped: string[] = [];
+  let n = 0;
+  for (const p of filePaths) {
+    const file = Bun.file(p);
+    if (!(await file.exists())) {
+      skipped.push(`${basename(p)} (not found)`);
+      continue;
+    }
+    if (file.size > MAX_INBOUND_FILE_BYTES) {
+      skipped.push(`${basename(p)} (>25MB)`);
+      continue;
+    }
+    form.append(`files[${n}]`, new Blob([await file.arrayBuffer()]), basename(p));
+    n++;
+  }
+  const payload: Record<string, unknown> = {};
+  const content = text.replace(/\[react:[^\]\r\n]+\]/gi, "").trim();
+  if (content) payload.content = content.slice(0, 2000);
+  if (replyToMessageId) {
+    payload.message_reference = { message_id: replyToMessageId, fail_if_not_exists: false };
+  }
+  // Nothing attachable and no text → nothing to send.
+  if (n === 0 && !content) return { skipped };
+  if (n === 0) {
+    // All files skipped but there's text — fall back to a plain message.
+    await sendMessage(token, channelId, content, undefined, replyToMessageId);
+    return { skipped };
+  }
+  form.append("payload_json", JSON.stringify(payload));
+  const res = await fetch(`${DISCORD_API}/channels/${channelId}/messages`, {
+    method: "POST",
+    headers: { Authorization: `Bot ${token}` },
+    body: form,
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`Discord file upload failed: ${res.status} ${errText}`);
+  }
+  return { skipped };
 }
 
 async function sendMessageToUser(
@@ -220,6 +316,19 @@ async function sendTyping(token: string, channelId: string): Promise<void> {
   await discordApi(token, "POST", `/channels/${channelId}/typing`).catch(() => {});
 }
 
+/**
+ * Broker typing indicator. The broker calls this (via onInbound) while a lane
+ * works a turn, so a slow high-effort reply shows "claude_hermes is typing…"
+ * instead of dead silence. Reads the token from settings (like brokerReply) and
+ * is fully best-effort (swallows errors). Discord typing auto-expires after ~10s,
+ * so the daemon refreshes it on an interval until the final reply.
+ */
+export async function brokerSendTyping(chatId: string): Promise<void> {
+  const token = getSettings().discord.token;
+  if (!token) return;
+  await sendTyping(token, chatId);
+}
+
 export async function sendReaction(
   token: string,
   channelId: string,
@@ -239,13 +348,12 @@ export async function sendReaction(
  * (`sendMessage` with chunking + `[react:]` stripping), so the broker never
  * re-implements that logic.
  *
- * Re-validates `chatId` against the bot's own routing allowlist before sending:
- * a session may only reply to a channel it is actually wired to. The allowlist
- * is the union of `channelDirectories` keys (mapped channels) + the configured
- * `listenChannels` + any known thread channel (whose parent is mapped). An
- * unrecognised `chatId` throws an `allowlist`-tagged error so ipc.ts maps it to
- * the `chat_id not allowlisted` reply_ack — the session never exfiltrates to an
- * arbitrary channel by minting a foreign chat_id.
+ * Re-validates `chatId` against the bot's own routing allowlist before sending
+ * via `assertBrokerEgressAllowed` (see its doc for the allowlist union and the
+ * ownership rule): a session may only reply to a channel it is actually wired
+ * to. An unrecognised `chatId` throws an `allowlist`-tagged error so ipc.ts
+ * maps it to the `chat_id not allowlisted` reply_ack — the session never
+ * exfiltrates to an arbitrary channel by minting a foreign chat_id.
  *
  * ALSO enforces per-session ownership: the replying `sessionKey` must be the one
  * that owns `chatId` (the same sessionKey execClaude derives for that channel /
@@ -257,40 +365,238 @@ export async function sendReaction(
  * `reply_to` is accepted for the schema but threaded replies are Phase-2; for
  * now it is logged and the message goes to the channel directly.
  */
+/**
+ * Last-resort DM check for broker egress: a tmux lane can outlive a daemon
+ * restart, so its reply may arrive before the user DMs again (knownDMs is
+ * empty after boot). Look the channel up and allow only a real DM (type 1)
+ * whose recipient is an allowlisted user, caching a hit so the lookup happens
+ * at most once per channel per boot. Fails closed on any API error.
+ */
+async function verifyDmChannel(
+  token: string,
+  chatId: string,
+  allowedUserIds: string[],
+): Promise<boolean> {
+  if (knownDMs.has(chatId)) return true;
+  try {
+    const ch = await discordApi<{ type?: number; recipients?: Array<{ id?: string }> }>(
+      token,
+      "GET",
+      `/channels/${chatId}`,
+    );
+    const ok =
+      ch.type === 1 &&
+      (ch.recipients ?? []).some((r) => r.id !== undefined && allowedUserIds.includes(r.id));
+    if (ok) knownDMs.add(chatId);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Shared egress gate for every broker→Discord text path (`reply`, `progress`).
+ * Throws an `allowlist`-tagged error (ipc.ts regex-matches /allowlist/i for the
+ * ack) unless `chatId` is a destination this lane may write to:
+ *
+ *   1. Allowlist: union of `channelDirectories` keys + `listenChannels` + any
+ *      known thread channel + any verified DM channel (see knownDMs above).
+ *   2. Ownership: the replying `sessionKey` must own `chatId` — a thread accepts
+ *      its own lane (threadKey) OR its parent channel's workspace lane (so a
+ *      channel session that just created a thread can post into it); a plain
+ *      channel or DM is owned only by its workspace lane.
+ *
+ * Every broker egress callback MUST run this before touching the Discord API —
+ * a lane is an interactive Claude session fed untrusted content, so an ungated
+ * path is an exfiltration primitive (the worst a gated lane can reach is a DM
+ * with an already-allowlisted user).
+ */
+async function assertBrokerEgressAllowed(
+  caller: string,
+  sessionKey: string,
+  chatId: string,
+  config: { token: string; channelDirectories?: Record<string, string>; listenChannels: string[]; allowedUserIds: string[] },
+): Promise<void> {
+  const mapped = new Set<string>(Object.keys(config.channelDirectories ?? {}));
+  for (const ch of config.listenChannels) mapped.add(ch);
+  const parentId = knownThreads.get(chatId)?.parentId;
+  const allowed =
+    mapped.has(chatId) ||
+    (parentId !== undefined && mapped.has(parentId)) ||
+    knownThreads.has(chatId) ||
+    (await verifyDmChannel(config.token, chatId, config.allowedUserIds));
+  if (!allowed) {
+    throw new Error(`${caller}: chat_id ${chatId} not allowlisted (no channelDirectories/listenChannels/thread/DM match)`);
+  }
+  const isThread = knownThreads.has(chatId);
+  const channelOwner = workspaceKey(resolveChannelCwd(chatId));
+  const ownerKeys = isThread ? [threadKey("discord", chatId), channelOwner] : [channelOwner];
+  if (!ownerKeys.includes(sessionKey)) {
+    throw new Error(
+      `${caller}: chat_id ${chatId} not allowlisted for session ${sessionKey} (owners ${ownerKeys.join("/")})`,
+    );
+  }
+}
+
 export async function brokerReply(
   sessionKey: string,
   chatId: string,
   text: string,
   replyTo?: string,
+  files?: string[],
 ): Promise<void> {
   const config = getSettings().discord;
   if (!config.token) {
     throw new Error("brokerReply: Discord token not configured");
   }
-  const mapped = new Set<string>(Object.keys(config.channelDirectories ?? {}));
-  for (const ch of config.listenChannels) mapped.add(ch);
-  const parentId = knownThreads.get(chatId)?.parentId;
-  const allowed =
-    mapped.has(chatId) || (parentId !== undefined && mapped.has(parentId)) || knownThreads.has(chatId);
-  if (!allowed) {
-    throw new Error(`brokerReply: chat_id ${chatId} not allowlisted (no channelDirectories/listenChannels/thread match)`);
-  }
-  // Per-session ownership: the chatId must map back to the SAME sessionKey the
-  // runner would mint for it. A thread is its own lane; a plain channel shares a
-  // workspace lane keyed on its resolved cwd. Mismatch = cross-lane reply.
-  const isThread = knownThreads.has(chatId);
-  const ownerKey = isThread
-    ? threadKey("discord", chatId)
-    : workspaceKey(resolveChannelCwd(chatId));
-  if (ownerKey !== sessionKey) {
-    throw new Error(
-      `brokerReply: chat_id ${chatId} not allowlisted for session ${sessionKey} (owner ${ownerKey})`,
+  await assertBrokerEgressAllowed("brokerReply", sessionKey, chatId, config);
+  // A `[react:emoji]` directive in the reply text → add a reaction. It targets the
+  // message Claude is replying to (reply_to). Without a target we can't react, so
+  // we skip it (the text/files still go out). This mirrors the metered path, which
+  // reacts to the triggering message.
+  const { cleanedText, reactionEmoji } = extractReactionDirective(text);
+  if (reactionEmoji && replyTo) {
+    await sendReaction(config.token, chatId, replyTo, reactionEmoji).catch((err) =>
+      console.error(`[Discord] broker reaction failed: ${err instanceof Error ? err.message : err}`),
     );
   }
-  if (replyTo) {
-    debugLog(`brokerReply: reply_to=${replyTo} ignored (threaded replies are Phase-2)`);
+  // Outbound files (multipart). On partial failure, tell the user which were dropped.
+  if (files && files.length > 0) {
+    const { skipped } = await sendFilesToChannel(config.token, chatId, cleanedText, files, replyTo);
+    if (skipped.length > 0) {
+      await sendMessage(
+        config.token,
+        chatId,
+        `⚠️ Couldn't attach: ${skipped.join(", ")}`,
+        undefined,
+        replyTo,
+      );
+    }
+    return;
   }
-  await sendMessage(config.token, chatId, text);
+  // `reply_to` → native Discord reply reference (a quote of that message).
+  await sendMessage(config.token, chatId, cleanedText, undefined, replyTo);
+}
+
+/**
+ * Broker egress for the shim's `progress` tool: a LIVE status line for a slow
+ * turn. The first call posts a message ("🔍 睇緊 memory…"); each subsequent call
+ * EDITS that same message in place, so the user watches the agent's intent update
+ * without message spam. The turn-final reply removes it via clearBrokerStatus.
+ *
+ * Runs the SAME `assertBrokerEgressAllowed` gate as brokerReply — `chat_id` is
+ * lane-supplied free text, so an ungated progress post would let a lane write
+ * arbitrary text into any channel the bot can see, trivially bypassing the
+ * reply gate. Gate failures propagate (ipc.ts acks them as allowlist errors);
+ * only the post/edit itself is best-effort (a failed edit — e.g. message
+ * deleted — just forgets the tracked id).
+ */
+export async function brokerProgress(sessionKey: string, chatId: string, text: string): Promise<void> {
+  const config = getSettings().discord;
+  const token = config.token;
+  if (!token) return;
+  await assertBrokerEgressAllowed("brokerProgress", sessionKey, chatId, config);
+  const clean = text.replace(/\[react:[^\]\r\n]+\]/gi, "").trim().slice(0, 2000) || "⏳ …";
+  const existing = brokerStatusMsg.get(chatId);
+  try {
+    if (existing) {
+      await discordApi(token, "PATCH", `/channels/${chatId}/messages/${existing}`, {
+        content: clean,
+      });
+    } else {
+      const res = await discordApi<{ id: string }>(token, "POST", `/channels/${chatId}/messages`, {
+        content: clean,
+      });
+      brokerStatusMsg.set(chatId, res.id);
+    }
+  } catch (err) {
+    // Lost the status message (deleted / perms) — forget it so the next progress
+    // call posts a fresh one instead of looping on a dead edit.
+    brokerStatusMsg.delete(chatId);
+    debugLog(`brokerProgress edit failed for ${chatId}: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+/**
+ * Delete + forget the live status message for a chat (called on the turn-final
+ * reply, and at the start of a new turn so a stranded status from an
+ * un-finalized prior turn can't linger). Best-effort.
+ */
+export function clearBrokerStatus(chatId: string): void {
+  const id = brokerStatusMsg.get(chatId);
+  brokerStatusMsg.delete(chatId);
+  if (!id) return;
+  const token = getSettings().discord.token;
+  if (token) {
+    void discordApi(token, "DELETE", `/channels/${chatId}/messages/${id}`).catch(() => {});
+  }
+}
+
+/**
+ * Delete + forget ALL live status messages. Called on broker shutdown so a daemon
+ * restart that kills lanes mid-turn doesn't strand orphaned "⏳ …" messages (the
+ * killed lane never sends its final reply to clear them). Awaits the deletes
+ * best-effort so they actually go out before the process exits.
+ */
+export async function clearAllBrokerStatus(): Promise<void> {
+  const entries = [...brokerStatusMsg.entries()];
+  brokerStatusMsg.clear();
+  const token = getSettings().discord.token;
+  if (!token || entries.length === 0) return;
+  await Promise.all(
+    entries.map(([chatId, id]) =>
+      discordApi(token, "DELETE", `/channels/${chatId}/messages/${id}`).catch(() => {}),
+    ),
+  );
+}
+
+/**
+ * Broker egress for the shim's `create_thread` tool. Creates a real Discord
+ * thread under an allowlisted parent channel and registers it in knownThreads so
+ * the user's subsequent messages in it route to (and the bot can reply into) that
+ * thread's OWN lane — the "threads => session" model. Mirrors brokerReply's
+ * fail-closed allowlist + per-session ownership guard: only the session that owns
+ * the parent CHANNEL lane may open threads under it. Returns the new thread id so
+ * Claude can `reply` into it (chat_id = threadId).
+ */
+export async function brokerCreateThread(
+  sessionKey: string,
+  parentChatId: string,
+  name: string,
+  seedText?: string,
+): Promise<{ threadId: string; parentId: string }> {
+  const config = getSettings().discord;
+  if (!config.token) {
+    throw new Error("brokerCreateThread: Discord token not configured");
+  }
+  const mapped = new Set<string>(Object.keys(config.channelDirectories ?? {}));
+  for (const ch of config.listenChannels) mapped.add(ch);
+  if (!mapped.has(parentChatId)) {
+    throw new Error(`brokerCreateThread: parent ${parentChatId} not allowlisted (no channelDirectories/listenChannels match)`);
+  }
+  // A thread is a child of a CHANNEL lane (Discord forbids threads-in-threads),
+  // so the creating session must own the parent channel's workspace lane.
+  const ownerKey = workspaceKey(resolveChannelCwd(parentChatId));
+  if (ownerKey !== sessionKey) {
+    throw new Error(
+      `brokerCreateThread: parent ${parentChatId} not owned by session ${sessionKey} (owner ${ownerKey})`,
+    );
+  }
+  const cleanName = name.replace(/\s+/g, " ").trim().slice(0, 100) || "thread";
+  const thread = await discordApi<{ id: string; name: string }>(
+    config.token,
+    "POST",
+    `/channels/${parentChatId}/threads`,
+    { name: cleanName, type: 11 /* PUBLIC_THREAD */, auto_archive_duration: 4320 },
+  );
+  knownThreads.set(thread.id, { parentId: parentChatId });
+  if (seedText && seedText.trim()) {
+    await sendMessage(config.token, thread.id, seedText);
+  }
+  console.log(
+    `[Discord] broker thread created: ${thread.id} name="${cleanName}" parent=${parentChatId} (session ${sessionKey})`,
+  );
+  return { threadId: thread.id, parentId: parentChatId };
 }
 
 // --- Reaction directive extraction (same as telegram.ts) ---
@@ -311,24 +617,28 @@ function extractReactionDirective(text: string): { cleanedText: string; reaction
 
 // --- Thread rejoin helper ---
 async function rejoinThreads(token: string): Promise<void> {
-  const threadSessions = await listThreadSessions();
-  for (const ts of threadSessions) {
+  // Union of persisted (metered sessionManager) threads + in-memory knownThreads.
+  // CRITICAL: broker-created threads live ONLY in knownThreads (not sessions.json),
+  // so a resume that rejoined only the persisted set would silently stop the bot
+  // receiving their MESSAGE_CREATE events — the "no response in a new thread" bug.
+  const persisted = await listThreadSessions();
+  const ids = new Set<string>();
+  for (const ts of persisted) ids.add(ts.threadId);
+  for (const id of knownThreads.keys()) ids.add(id);
+  let n = 0;
+  for (const threadId of ids) {
     try {
-      await discordApi(token, "PUT", `/channels/${ts.threadId}/thread-members/@me`);
-      if (!knownThreads.has(ts.threadId)) {
-        const ch = await discordApi<{ parent_id?: string }>(token, "GET", `/channels/${ts.threadId}`);
-        if (ch.parent_id) {
-          knownThreads.set(ts.threadId, { parentId: ch.parent_id });
-        }
+      await discordApi(token, "PUT", `/channels/${threadId}/thread-members/@me`);
+      if (!knownThreads.has(threadId)) {
+        const ch = await discordApi<{ parent_id?: string }>(token, "GET", `/channels/${threadId}`);
+        if (ch.parent_id) knownThreads.set(threadId, { parentId: ch.parent_id });
       }
-      console.log(`[Discord] Rejoined thread: ${ts.threadId}`);
+      n++;
     } catch (err) {
-      console.error(`[Discord] Failed to rejoin thread ${ts.threadId}: ${err}`);
+      console.error(`[Discord] Failed to rejoin thread ${threadId}: ${err}`);
     }
   }
-  if (threadSessions.length > 0) {
-    console.log(`[Discord] Rejoined ${threadSessions.length} thread(s) from sessions.json`);
-  }
+  if (n > 0) console.log(`[Discord] Rejoined ${n} thread(s) (persisted + knownThreads)`);
 }
 
 // --- Guild trigger logic ---
@@ -366,17 +676,25 @@ function isVoiceAttachment(a: DiscordAttachment): boolean {
   return Boolean(a.content_type?.startsWith("audio/"));
 }
 
+// Don't pull huge files into the box; Claude can't usefully read them and it
+// risks filling disk. Discord's own non-Nitro upload cap is 25 MiB anyway.
+const MAX_INBOUND_FILE_BYTES = 25 * 1024 * 1024;
+
 async function downloadDiscordAttachment(
   attachment: DiscordAttachment,
-  type: "image" | "voice",
+  type: "image" | "voice" | "file",
 ): Promise<string | null> {
+  if (attachment.size > MAX_INBOUND_FILE_BYTES) {
+    debugLog(`Attachment ${attachment.filename} too large (${attachment.size}B); skipping download`);
+    return null;
+  }
   const dir = discordInboxDir();
   await mkdir(dir, { recursive: true });
 
   const response = await fetch(attachment.url);
   if (!response.ok) throw new Error(`Discord attachment download failed: ${response.status}`);
 
-  const ext = extname(attachment.filename) || (type === "voice" ? ".ogg" : ".jpg");
+  const ext = extname(attachment.filename) || (type === "voice" ? ".ogg" : type === "image" ? ".jpg" : "");
   const filename = `${attachment.id}-${Date.now()}${ext}`;
   const localPath = join(dir, filename);
 
@@ -483,13 +801,41 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     return;
   }
 
-  // Detect attachments
+  // Authorized inbound DM — pre-warm the verified-DM cache so broker egress
+  // (brokerReply/brokerProgress) can pass its allowlist gate without paying the
+  // channel lookup on the reply path; DM channel ids never appear in
+  // channelDirectories or listenChannels. Verification (not a blind insert):
+  // `!guild_id` is also true for group DMs (type 3), which must stay barred.
+  if (isDM) void verifyDmChannel(config.token, channelId, config.allowedUserIds);
+
+  // Detect attachments — image / voice get special handling (vision /
+  // transcribe); everything else is a generic file we download + hand Claude the
+  // path. A forward / poll / sticker carries no `content` but is still a real
+  // inbound, so each keeps the message alive past the empty-content guard.
   const imageAttachments = message.attachments.filter(isImageAttachment);
   const voiceAttachments = message.attachments.filter(isVoiceAttachment);
+  const fileAttachments = message.attachments.filter(
+    (a) => !isImageAttachment(a) && !isVoiceAttachment(a),
+  );
   const hasImage = imageAttachments.length > 0;
   const hasVoice = voiceAttachments.length > 0;
+  const hasFile = fileAttachments.length > 0;
+  const isForward =
+    message.message_reference?.type === 1 || (message.message_snapshots?.length ?? 0) > 0;
+  const hasPoll = Boolean(message.poll);
+  const hasSticker = (message.sticker_items?.length ?? 0) > 0;
 
-  if (!content.trim() && !hasImage && !hasVoice) return;
+  if (
+    !content.trim() &&
+    !hasImage &&
+    !hasVoice &&
+    !hasFile &&
+    !isForward &&
+    !hasPoll &&
+    !hasSticker
+  ) {
+    return;
+  }
 
   // Strip bot mention from content for cleaner prompt
   let cleanContent = content;
@@ -498,7 +844,14 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
   }
 
   const label = message.author.username;
-  const mediaParts = [hasImage ? "image" : "", hasVoice ? "voice" : ""].filter(Boolean);
+  const mediaParts = [
+    hasImage ? "image" : "",
+    hasVoice ? "voice" : "",
+    hasFile ? "file" : "",
+    isForward ? "forward" : "",
+    hasPoll ? "poll" : "",
+    hasSticker ? "sticker" : "",
+  ].filter(Boolean);
   const mediaSuffix = mediaParts.length > 0 ? ` [${mediaParts.join("+")}]` : "";
   console.log(
     `[${new Date().toLocaleTimeString()}] Discord ${label}${mediaSuffix}: "${cleanContent.slice(0, 60)}${cleanContent.length > 60 ? "..." : ""}"`,
@@ -513,6 +866,28 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     let imagePath: string | null = null;
     let voicePath: string | null = null;
     let voiceTranscript: string | null = null;
+    const filePaths: string[] = [];
+    // Things we saw but can't fully process — surfaced to Claude so it can tell
+    // the user instead of silently dropping (no "why did nothing happen?").
+    const unsupportedNotes: string[] = [];
+
+    if (hasFile) {
+      for (const att of fileAttachments) {
+        try {
+          const p = await downloadDiscordAttachment(att, "file");
+          if (p) filePaths.push(p);
+          else
+            unsupportedNotes.push(
+              `a file "${att.filename}" (${Math.round(att.size / 1024)}KB) too large to download (>25MB)`,
+            );
+        } catch (err) {
+          unsupportedNotes.push(`a file "${att.filename}" that failed to download`);
+          console.error(
+            `[Discord] Failed to download file ${att.filename} for ${label}: ${err instanceof Error ? err.message : err}`,
+          );
+        }
+      }
+    }
 
     if (hasImage) {
       try {
@@ -627,6 +1002,14 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
 
     // Build prompt (same pattern as Telegram)
     const promptParts = [`[Discord from ${label}]`];
+    // If this message is a native reply to ANOTHER message, quote what it replied
+    // to — otherwise a bare "呢個" / "this one" pointing at an earlier message is
+    // unresolvable to Claude (it only sees the new message, not the reply target).
+    const ref = message.referenced_message;
+    if (ref && (ref.content ?? "").trim()) {
+      const refAuthor = ref.author?.username ?? "someone";
+      promptParts.push(`(In reply to ${refAuthor}: "${ref.content.trim().slice(0, 1500)}")`);
+    }
     if (skillContext) {
       const args = cleanContent.trim().slice(command!.length).trim();
       promptParts.push(`<command-name>${command}</command-name>`);
@@ -647,6 +1030,49 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     } else if (hasVoice) {
       promptParts.push(
         "The user attached voice audio, but it could not be transcribed. Respond and ask them to resend a clearer clip.",
+      );
+    }
+    if (filePaths.length > 0) {
+      for (const fp of filePaths) promptParts.push(`Attached file path: ${fp}`);
+      promptParts.push(
+        "The user attached the file(s) above (saved locally). Read them if relevant before answering.",
+      );
+    }
+    if (isForward) {
+      const snap = message.message_snapshots?.[0]?.message;
+      const fwd: string[] = [];
+      if (snap?.content?.trim()) fwd.push(snap.content.trim());
+      if (snap?.attachments?.length) {
+        fwd.push(`[${snap.attachments.length} attachment(s): ${snap.attachments.map((a) => a.filename).join(", ")}]`);
+      }
+      if (snap?.poll?.question?.text) fwd.push(`[forwarded poll: ${snap.poll.question.text}]`);
+      promptParts.push(
+        fwd.length > 0
+          ? `Forwarded message:\n${fwd.join("\n")}`
+          : "The user forwarded a message, but Hermes couldn't read its contents — tell them you see a forward but can't read it.",
+      );
+    }
+    if (hasPoll) {
+      const q = message.poll?.question?.text ?? "(no question text)";
+      const opts = (message.poll?.answers ?? [])
+        .map((a) => a.poll_media?.text)
+        .filter((t): t is string => Boolean(t))
+        .join(" | ");
+      promptParts.push(
+        `The user sent a POLL — question: "${q}"; options: ${opts || "(none)"}. ` +
+          "You can see the question and options but NOT live vote counts. Acknowledge it and, if relevant, " +
+          "tell the user you can't tally poll votes yet.",
+      );
+    }
+    if (hasSticker) {
+      const names = (message.sticker_items ?? []).map((s) => s.name).join(", ");
+      promptParts.push(
+        `The user sent sticker(s): ${names}. You see the sticker name(s) but not the image — respond to the intent.`,
+      );
+    }
+    for (const note of unsupportedNotes) {
+      promptParts.push(
+        `NOTE: the user's message included ${note}. Tell the user you received it but can't process that part yet, so they're not left wondering why nothing happened.`,
       );
     }
 
@@ -1107,6 +1533,19 @@ function handleDispatch(token: string, eventName: string, data: any): void {
       if (data.id && data.parent_id) {
         knownThreads.set(data.id, { parentId: data.parent_id });
         debugLog(`Thread tracked: ${data.id} (parent: ${data.parent_id})`);
+        // A bot only receives a thread's MESSAGE_CREATE once it's a MEMBER. Join
+        // any thread under a channel we watch (listenChannels / channelDirectories)
+        // so user-opened threads work too — not just bot-created ones (which
+        // auto-join). Gated on watched parents so we don't join every guild thread.
+        const cfg = getSettings().discord;
+        const watched =
+          cfg.listenChannels.includes(data.parent_id) ||
+          Boolean(cfg.channelDirectories?.[data.parent_id]);
+        if (watched) {
+          void discordApi(token, "PUT", `/channels/${data.id}/thread-members/@me`).catch((err) =>
+            console.error(`[Discord] Failed to join thread ${data.id}: ${err}`),
+          );
+        }
       }
       break;
 

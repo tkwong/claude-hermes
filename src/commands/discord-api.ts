@@ -21,6 +21,7 @@ export const DISCORD_API = "https://discord.com/api/v10";
 
 const DEFAULT_MAX_RETRIES = 4;
 const DEFAULT_BASE_BACKOFF_MS = 500;
+const DEFAULT_ATTEMPT_TIMEOUT_MS = 30_000;
 const RETRYABLE_STATUS = new Set([500, 502, 503, 504]);
 
 /**
@@ -44,6 +45,14 @@ export interface DiscordApiDeps {
    * outage and turns a small spike into a thundering herd.
    */
   rng?: () => number;
+  /**
+   * Per-attempt timeout. Without one, a single stalled connection hangs the
+   * caller forever — and broker egress is serialized per lane (replyChains),
+   * so one hung fetch mutes that lane until the daemon restarts while the
+   * lane's shim still answers liveness pings. A timed-out attempt counts as a
+   * network error and consumes the same retry budget.
+   */
+  timeoutMs?: number;
 }
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -60,6 +69,7 @@ export async function discordApi<T>(
   const maxRetries = deps.maxRetries ?? DEFAULT_MAX_RETRIES;
   const baseBackoff = deps.baseBackoffMs ?? DEFAULT_BASE_BACKOFF_MS;
   const rng = deps.rng ?? Math.random;
+  const timeoutMs = deps.timeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS;
 
   const backoffWithJitter = (att: number): number => {
     const raw = baseBackoff * 2 ** att;
@@ -78,6 +88,7 @@ export async function discordApi<T>(
           "Content-Type": "application/json",
         },
         body: body !== undefined ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (err) {
       if (attempt >= maxRetries) throw err;

@@ -14,6 +14,7 @@ import { join } from "node:path";
 import {
   createSessionSupervisor,
   sanitizeTmuxName,
+  sessionUuidFor,
   type SessionSupervisor,
   type TmuxResult,
 } from "./sessions";
@@ -103,10 +104,27 @@ describe("session supervisor (stubbed spawn)", () => {
     await sup.ensureSession("workspace:abc123", "/tmp/projA");
     const newSession = calls.find((c) => c.args[0] === "new-session");
     expect(newSession).toBeDefined();
-    const joined = newSession?.args.join(" ") ?? "";
+    const args = newSession?.args ?? [];
+    const joined = args.join(" ");
     expect(joined).toContain("--channels");
     expect(joined).toContain("plugin:discord@claude-plugins-official");
     expect(joined).toContain("--dangerously-skip-permissions");
+    // The channel only spawns if the plugin is enabled in the lane scope, so the
+    // launch must enable it per-lane via --settings (not user/project settings).
+    expect(joined).toContain("--settings");
+    expect(joined).toContain("enabledPlugins");
+    expect(joined).toContain('"discord@claude-plugins-official":true');
+    // HERMES_* MUST be injected via tmux `-e` so the pane (not just the tmux
+    // client) inherits them — otherwise the shim falls back to POC mode.
+    expect(args).toContain("-e");
+    expect(args.some((a) => a.startsWith("HERMES_BROKER_SOCK=") && a.includes("broker.sock"))).toBe(true);
+    expect(args).toContain("HERMES_SESSION_KEY=workspace:abc123");
+    expect(args.some((a) => a.startsWith("HERMES_TOKEN="))).toBe(true);
+    // First spawn (no transcript on disk for /tmp/projA) → --session-id with the
+    // lane's deterministic uuid, so a later respawn can --resume it.
+    expect(joined).toContain("--session-id");
+    expect(joined).toContain(sessionUuidFor("workspace:abc123"));
+    // The spawn env still carries them too (belt-and-suspenders for a cold server).
     expect(newSession?.env?.HERMES_SESSION_KEY).toBe("workspace:abc123");
     expect(newSession?.env?.HERMES_BROKER_SOCK).toContain("broker.sock");
     expect(typeof newSession?.env?.HERMES_TOKEN).toBe("string");
@@ -204,6 +222,42 @@ describe("session supervisor (stubbed spawn)", () => {
     const t = sup.get("workspace:k7")?.token ?? "";
     expect(sup.verifyToken("workspace:k7", t)).toBe(true);
     expect(sup.verifyToken("workspace:k7", `${t}x`)).toBe(false);
+    await sup.shutdown();
+  });
+
+  test("sessionUuidFor is deterministic, distinct per key, and v4-shaped", () => {
+    const a = sessionUuidFor("workspace:abc");
+    const b = sessionUuidFor("workspace:abc");
+    const c = sessionUuidFor("thread:discord:999");
+    expect(a).toBe(b); // stable across calls → same lane resumes the same session
+    expect(a).not.toBe(c);
+    expect(a).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  });
+
+  test("idle-reap kills an inactive lane (tmux + registry); next inbound cold-starts it", async () => {
+    let clock = 1_000_000;
+    const { sup, live } = makeSup({
+      now: () => clock,
+      idleReapMs: 1000,
+      sweepIntervalMs: 15, // enable the sweep (default in makeSup is 0)
+    });
+    await sup.ensureSession("workspace:idle", "/tmp/p");
+    sup.markPong("workspace:idle");
+    const tmuxName = sup.get("workspace:idle")?.tmuxName ?? "";
+    expect(sup.get("workspace:idle")?.state).toBe("live");
+    expect(live.has(tmuxName)).toBe(true);
+
+    // A heartbeat pong must NOT count as activity (else idle never trips).
+    clock += 2000;
+    sup.markPong("workspace:idle");
+    // Let a sweep tick run with the clock past idleReapMs.
+    await new Promise((r) => setTimeout(r, 60));
+    expect(sup.get("workspace:idle")).toBeUndefined(); // reaped from registry
+    expect(live.has(tmuxName)).toBe(false); // tmux killed
+
+    // Next inbound cold-starts a fresh lane (reap is invisible to the user).
+    await sup.ensureSession("workspace:idle", "/tmp/p");
+    expect(sup.get("workspace:idle")?.state).toBe("spawning");
     await sup.shutdown();
   });
 });
