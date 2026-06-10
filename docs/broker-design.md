@@ -5,6 +5,15 @@ I have everything verified against live source. Producing the deliverable doc.
 **Status:** design + POC spec. Decision = **Approach B (Minimal Hermes Rework)** with grafted durable-inbox / decoupled-egress / heartbeat ideas from A & C.
 **Verified on this machine (2026-06-06):** `claude 2.1.166`, `bun 1.3.9`. **Two hard blockers found:** (1) `--dangerously-load-development-channels` is **NOT** in `claude --help` (only `--dangerously-skip-permissions` is); (2) **tmux is NOT installed**. Both must be resolved at POC-0 step 0 before any code — see §7.
 
+> **Update (2026-06-10):** both blockers resolved (tmux installed; the channel
+> path works via shim masquerade). **Phase 0 + Phase 1 are built and running
+> live** under launchd on this machine, with `useBrokerSessions: true`. For how
+> the deployed system runs (process management, logs, inbox recovery, the egress
+> security model) and the open follow-ups, see **[`broker-operations.md`](broker-operations.md)**.
+> This document remains the design rationale; several §8 open decisions are now
+> settled (session granularity = `workspaceKey` per channel; idle-reap
+> implemented but currently disabled pending fixes).
+
 ---
 
 ## 1. Architecture
